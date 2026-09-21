@@ -1,0 +1,113 @@
+# noiz deployment topology (§2.3).
+#
+# Minimum host: 2 vCPU, 4 GB RAM, storage sized to the library plus ~1.3x for
+# transcoded renditions.
+
+name: noiz
+
+x-api-env: &api-env
+  NOIZ_ENVIRONMENT: production
+  NOIZ_DATABASE_URL: postgresql://noiz:${POSTGRES_PASSWORD:-noiz}@postgres:5432/noiz
+  NOIZ_REDIS_URL: redis://redis:6379/0
+  NOIZ_JWT_SECRET: ${NOIZ_JWT_SECRET:?set NOIZ_JWT_SECRET in .env}
+  NOIZ_STREAM_HMAC_SECRET: ${NOIZ_STREAM_HMAC_SECRET:?set NOIZ_STREAM_HMAC_SECRET in .env}
+  NOIZ_MEDIA_ROOT: /media
+  NOIZ_INBOX_ROOT: /inbox
+  NOIZ_X_ACCEL_ENABLED: "true"
+  NOIZ_X_ACCEL_INTERNAL_PREFIX: /_media
+
+services:
+  nginx:
+    image: nginx:1.27
+    restart: unless-stopped
+    ports: ["443:443", "80:80"]
+    volumes:
+      - ./backend/nginx.conf:/etc/nginx/nginx.conf:ro
+      - media:/media:ro
+      - certs:/certs:ro
+    depends_on: [api]
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    command: uvicorn noiz.main:app --host 0.0.0.0 --port 8000 --workers 2
+    env_file: .env
+    environment: *api-env
+    volumes:
+      - media:/media:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    # ADR 3: CPU-bound ffmpeg/Essentia work needs processes, not coroutines.
+    command: celery -A noiz.worker worker -Q ingest,transcode,analysis,enrich,scrobble -c 4
+    env_file: .env
+    environment: *api-env
+    volumes:
+      - media:/media
+      - inbox:/inbox
+    # Analysis is best-effort: keep it below interactive work (PRD §2.3).
+    cpu_shares: 512
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  beat:
+    build: ./backend
+    restart: unless-stopped
+    command: celery -A noiz.worker beat
+    env_file: .env
+    environment: *api-env
+    depends_on: [redis]
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: noiz
+      POSTGRES_USER: noiz
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-noiz}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U noiz -d noiz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly no --save ""
+    volumes:
+      - redisdata:/data
+
+  # Optional S3-compatible media store (ADR 4). Enable with: --profile s3
+  minio:
+    image: minio/minio
+    profiles: ["s3"]
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-noiz}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    volumes:
+      - miniodata:/data
+
+  # Optional tusd; the API ships a built-in tus endpoint by default.
+  tusd:
+    image: tusproject/tusd
+    profiles: ["tus"]
+    command: -behind-proxy -upload-dir /inbox
+    volumes:
+      - inbox:/inbox
+
+volumes:
+  media: {}
+  inbox: {}
+  pgdata: {}
+  redisdata: {}
+  miniodata: {}
+  certs: {}
