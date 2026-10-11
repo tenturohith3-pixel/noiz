@@ -7,6 +7,14 @@ plugins {
     alias(libs.plugins.hilt)
 }
 
+/**
+ * Release signing is opt-in through the environment so a debug build never needs a
+ * keystore. `storeFile = file("")` throws "path may not be null or empty string" at
+ * configuration time, so the signing config is only declared when a store is set.
+ */
+val releaseStoreFile: String? =
+    System.getenv("NOIZ_STORE_FILE")?.takeIf { it.isNotBlank() }
+
 android {
     namespace = "com.noiz.app"
     compileSdk = 36
@@ -22,14 +30,17 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // Release signing is opt-in via environment variables so a debug build never needs a
+    // keystore. `storeFile = file("")` throws "path may not be null or empty string" at
+    // configuration time, so the config is only declared when a store file is set.
     signingConfigs {
-        // Populate these from ~/.gradle/gradle.properties or the environment in CI.
-        // Without a signingConfig, `assembleRelease` produced an unsigned APK.
-        create("release") {
-            storeFile = file(System.getenv("NOIZ_STORE_FILE") ?: "")
-            storePassword = System.getenv("NOIZ_STORE_PASSWORD")
-            keyAlias = System.getenv("NOIZ_KEY_ALIAS")
-            keyPassword = System.getenv("NOIZ_KEY_PASSWORD")
+        releaseStoreFile?.let { store ->
+            create("release") {
+                storeFile = file(store)
+                storePassword = System.getenv("NOIZ_STORE_PASSWORD")
+                keyAlias = System.getenv("NOIZ_KEY_ALIAS")
+                keyPassword = System.getenv("NOIZ_KEY_PASSWORD")
+            }
         }
     }
 
@@ -38,7 +49,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            if (System.getenv("NOIZ_STORE_FILE") != null) {
+            if (releaseStoreFile != null) {
                 signingConfig = signingConfigs.getByName("release")
             }
         }

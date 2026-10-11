@@ -20,7 +20,7 @@ data class User(
 
 data class NoizSession(
     /** Stored verbatim; use [normalizedServerUrl] when dialling. */
-    serverUrl: String,
+    val serverUrl: String,
     val accessToken: String,
     val refreshToken: String,
     /** Epoch millis the access token stops being valid; used to refresh proactively. */
