@@ -23,7 +23,11 @@ data class EngineTrack(
     /** Continuous with the next track: never crossfaded (§6.2). */
     val gaplessNext: Boolean = false,
     val durationMs: Long = 0L,
-)
+) {
+    companion object {
+        const val DEFAULT_RENDITION = "orig"
+    }
+}
 
 enum class PlaybackMode {
     /** crossfade == 0: one ExoPlayer plays the playlist, ExoPlayer handles gapless. */
@@ -40,6 +44,12 @@ data class EngineSnapshot(
     val bufferedPositionMs: Long = 0L,
     val durationMs: Long = 0L,
     val isPlaying: Boolean = false,
+    /**
+     * Distinct from [isPlaying]: this stays true while buffering or preparing, which is
+     * what MediaSession and the foreground service key off. Conflating the two made the
+     * notification flicker and the service drop on every rebuffer.
+     */
+    val playWhenReady: Boolean = false,
     val playbackState: Int = Player.STATE_IDLE,
     val mode: PlaybackMode = PlaybackMode.Gapless,
     val shuffleModeEnabled: Boolean = false,
@@ -100,6 +110,15 @@ class DualPlayerEngine(
     private var shuffleModeEnabled = false
     private var repeatMode = Player.REPEAT_MODE_OFF
 
+    /**
+     * Engine-owned shuffle permutation of canonical indices. Empty when shuffle is off.
+     *
+     * ExoPlayer's own shuffle cannot be used: the canonical queue stays unshuffled so
+     * queue editing and index mapping work, which made a shuffled player index resolve
+     * to the wrong track.
+     */
+    private var shuffleOrder: List<Int> = emptyList()
+
     /** Current playback-mode setting, applied to both players. */
     var normalizationTargetLufs: Float? = NormalizationProcessor.TARGET_NORMAL_LUFS
         set(value) {
@@ -141,6 +160,10 @@ class DualPlayerEngine(
     fun setQueue(tracks: List<EngineTrack>, startIndex: Int = 0, startPositionMs: Long = 0L) {
         queue = tracks
         index = startIndex.coerceIn(0, maxOf(0, tracks.lastIndex))
+        // A new queue is a new context; a stale error from the previous one would
+        // otherwise still be on screen.
+        lastError = null
+        unplayable.clear()
         cancelCrossfade()
         reloadForMode(startPositionMs)
         applyNormalization(index)
@@ -149,6 +172,9 @@ class DualPlayerEngine(
 
     private fun reloadForMode(startPositionMs: Long = 0L) {
         val mode = if (crossfadeMs == 0L) PlaybackMode.Gapless else PlaybackMode.Dual
+        // Preserve the play intent: `stop()` also clears playWhenReady, so without this
+        // every queue edit silently paused playback.
+        val wasPlayWhenReady = active.playWhenReady
         active.stop()
         active.clearMediaItems()
         idle.stop()
@@ -160,7 +186,10 @@ class DualPlayerEngine(
                 val remaining = queue.drop(index).map { it.mediaItem }
                 if (remaining.isNotEmpty()) {
                     active.setMediaItems(remaining, 0, startPositionMs)
-                    active.shuffleModeEnabled = shuffleModeEnabled
+                    // Deliberately NOT delegating shuffle to ExoPlayer: the canonical
+                    // queue stays unshuffled, so a shuffled player index mapped onto it
+                    // reported the wrong track as playing and applied its loudness to the
+                    // wrong item. The engine owns the shuffle order instead.
                     active.repeatMode = repeatMode
                 }
             }
@@ -175,6 +204,9 @@ class DualPlayerEngine(
         }
         active.prepare()
         active.volume = volume
+        if (wasPlayWhenReady) {
+            active.play()
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -189,13 +221,20 @@ class DualPlayerEngine(
     }
 
     fun pause() {
+        // A crossfade in flight means `idle` is already playing at full volume, and
+        // `run()`'s finally-block never pauses it. Pausing only `active` therefore left
+        // audio playing after the user pressed pause.
+        cancelCrossfade()
         active.pause()
+        idle.pause()
+        idle.volume = 0f
         publish()
     }
 
     fun stop() {
         cancelCrossfade()
         active.stop()
+        idle.pause()
         stopMonitor()
         publish()
     }
@@ -259,14 +298,9 @@ class DualPlayerEngine(
             val to = idle
             val blend = minOf(CrossfadeController.SKIP_BLEND_MS, crossfadeMs)
             prepareOn(to, target, playWhenReady = true)
-            val job = crossfade.launch(scope, from, to, blend)
+            val job = crossfade.launch(scope, from, to, blend, volume)
             crossfadeJob = job
-            scope.launch {
-                job.join()
-                swap()
-                applyNormalization(target)
-                publish()
-            }
+            awaitCrossfadeThenSwap(job, target)
         } else {
             prepareOn(from, target, playWhenReady = wasPlaying)
             applyNormalization(target)
@@ -299,6 +333,10 @@ class DualPlayerEngine(
     }
 
     private fun tickDualMode() {
+        // Never start a ramp while paused: `run()` calls `inPlayer.play()`, so a tick
+        // landing after a `pause()` would resume audio with no user intent.
+        if (!active.isPlaying) return
+
         val duration = active.duration
         if (duration == C.TIME_UNSET || duration <= 0L) return
         val position = active.currentPosition
@@ -306,11 +344,17 @@ class DualPlayerEngine(
 
         val next = nextIndex(forward = true, userInitiated = false) ?: return
         val nextTrack = queue[next]
+        val currentTrack = queue.getOrNullSafe(index)
 
-        // Never crossfade album-continuous or live tracks (§6.2).
-        val mayCrossfade = !queue[index].gaplessNext &&
+        // Never crossfade album-continuous or live tracks (§6.2), and never fade a
+        // short incoming track that would end before the ramp finishes.
+        val mayCrossfade = currentTrack?.gaplessNext != true &&
             !nextTrack.gaplessNext &&
-            CrossfadeController.canCrossfade(duration, crossfadeMs)
+            CrossfadeController.canCrossfade(
+                currentDurationMs = duration,
+                nextDurationMs = nextTrack.durationMs,
+                crossfadeMs = crossfadeMs,
+            )
 
         if (!mayCrossfade) {
             if (remaining <= 0L) transitionTo(next, userSkip = false)
@@ -330,19 +374,9 @@ class DualPlayerEngine(
                 prepareOn(idle, next, playWhenReady = false)
                 nextPreparedIndex = next
             }
-            val out = active
-            val into = idle
-            crossfadeJob = crossfade.launch(scope, out, into, crossfadeMs)
-            scope.launch {
-                crossfadeJob?.join()
-                index = next
-                swap()
-                nextPreparedIndex = -1
-                applyNormalization(index)
-                // Pre-roll the loop for a continuous blend on the next boundary.
-                startMonitor()
-                publish()
-            }
+            val job = crossfade.launch(scope, active, idle, crossfadeMs, volume)
+            crossfadeJob = job
+            awaitCrossfadeThenSwap(job, next)
         }
     }
 
@@ -372,12 +406,38 @@ class DualPlayerEngine(
 
     private fun cancelCrossfade() {
         val job = crossfadeJob
+        crossfadeJob = null
+        nextPreparedIndex = -1
         if (job?.isActive == true) {
             crossfade.abort(active, idle)
             job.cancel()
         }
-        crossfadeJob = null
-        nextPreparedIndex = -1
+        // `abort()` zeroes the outgoing player's volume. Every caller of this method
+        // (seek / skip / stop) continues to use `active` afterwards, so restoring the
+        // user's volume here is what stops a seek during a crossfade from muting the
+        // rest of the session.
+        active.volume = volume
+        idle.volume = 0f
+    }
+
+    /**
+     * Awaits [job] and promotes the incoming player, but only if the ramp actually
+     * completed. `Job.join()` returns normally for an already-cancelled job, so without
+     * this guard a seek during a crossfade still advanced the canonical index and
+     * promoted the wrong player.
+     */
+    private fun awaitCrossfadeThenSwap(job: Job, next: Int) {
+        scope.launch {
+            job.join()
+            if (job.isCancelled) return@launch
+            index = next
+            swap()
+            nextPreparedIndex = -1
+            applyNormalization(index)
+            // Pre-roll the loop for a continuous blend on the next boundary.
+            startMonitor()
+            publish()
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -387,8 +447,31 @@ class DualPlayerEngine(
     fun setShuffleModeEnabled(enabled: Boolean) {
         if (shuffleModeEnabled == enabled) return
         shuffleModeEnabled = enabled
-        if (_snapshot.value.mode == PlaybackMode.Gapless) active.shuffleModeEnabled = enabled
+        // In Gapless mode the player holds the real playlist, so its own shuffle would
+        // permute player indices while the canonical queue stayed linear — the index
+        // mapping in onPositionDiscontinuity would then report the wrong track as
+        // playing. The engine owns the order instead and never delegates.
+        shuffleOrder = if (enabled) {
+            val shuffled = queue.indices.shuffled()
+            // Keep the current track first so shuffle does not interrupt playback.
+            (listOf(index) + shuffled.filter { it != index })
+        } else {
+            emptyList()
+        }
         publish()
+    }
+
+    /** Canonical index that follows [current], honouring shuffle order. */
+    private fun advanceShuffle(step: Int): Int? {
+        if (shuffleOrder.isEmpty()) return null
+        val pos = shuffleOrder.indexOf(index)
+        if (pos < 0) return null
+        val nextPos = pos + step
+        return when {
+            nextPos in shuffleOrder.indices -> shuffleOrder[nextPos]
+            repeatMode == Player.REPEAT_MODE_ALL -> shuffleOrder.first()
+            else -> null
+        }
     }
 
     fun setRepeatMode(mode: Int) {
@@ -397,19 +480,36 @@ class DualPlayerEngine(
         publish()
     }
 
+    /**
+     * Next/previous canonical index.
+     *
+     * Skips candidates already known to be unplayable: the error handler records them,
+     * but nothing consulted the set, so a corrupt file was retried on every pass and
+     * under REPEAT_ALL forever.
+     */
     private fun nextIndex(forward: Boolean, userInitiated: Boolean): Int? {
         if (queue.isEmpty()) return null
+
+        // Shuffle order is owned by the engine, so both modes advance identically.
+        if (shuffleOrder.isNotEmpty()) {
+            return advanceShuffle(if (forward) 1 else -1)?.takeUnless { isUnplayable(it) }
+        }
+
         val current = index
         val candidate = if (forward) current + 1 else current - 1
         return when {
-            candidate in queue.indices -> candidate
-            repeatMode == Player.REPEAT_MODE_ALL -> if (forward) 0 else queue.lastIndex
+            candidate in queue.indices -> candidate.takeUnless { isUnplayable(it) }
+            repeatMode == Player.REPEAT_MODE_ALL ->
+                if (forward) 0 else queue.lastIndex
             repeatMode == Player.REPEAT_MODE_ONE && !userInitiated -> current
             else -> null
         }
     }
 
     private fun previousIndex(): Int? = nextIndex(forward = false, userInitiated = true)
+
+    private fun isUnplayable(candidate: Int): Boolean =
+        queue.getOrNullSafe(candidate)?.mediaItem?.mediaId in unplayable
 
     // -----------------------------------------------------------------------
     // Normalization
@@ -434,9 +534,15 @@ class DualPlayerEngine(
     // Snapshot
     // -----------------------------------------------------------------------
 
-    private val listener = object : Player.Listener {
-        override fun onIsPlayingChanged(isPlaying: Boolean) = publish()
-        override fun onPlaybackStateChanged(playbackState: Int) = publish()
+    private fun listenerFor(owner: ExoPlayer) = object : Player.Listener {
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (owner === active) publish()
+        }
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (owner === active) publish()
+        }
+
         override fun onPositionDiscontinuity(
             oldPosition: Player.PositionInfo,
             newPosition: Player.PositionInfo,
@@ -453,19 +559,63 @@ class DualPlayerEngine(
         }
 
         override fun onPlayerError(error: PlaybackException) {
-            // A single bad file must never halt the queue (§11 row 15).
-            unplayable += queue.getOrNullSafe(index)?.mediaItem?.mediaId.orEmpty()
-            publish(error)
-            val next = nextIndex(forward = true, userInitiated = true)
-            if (next != null) transitionTo(next, userSkip = false) else pause()
+            // Mutating a player from inside its own event dispatch is not allowed, so
+            // post the transition. The listener is bound to one specific player: a
+            // prefetch failure on the idle player must not blacklist the track that is
+            // currently playing.
+            scope.launch {
+                if (owner !== active) {
+                    owner.currentMediaItem?.mediaId?.let { unplayable += it }
+                    return@launch
+                }
+
+                // A single bad file must never halt the queue (§11 row 15).
+                queue.getOrNullSafe(index)?.mediaItem?.mediaId?.let { unplayable += it }
+                lastError = error
+                publish()
+                val next = nextIndex(forward = true, userInitiated = true)
+                if (next != null) transitionTo(next, userSkip = false) else pause()
+            }
         }
+    }
+
+    private val primaryListener = listenerFor(primary)
+    private val secondaryListener = listenerFor(secondary)
+
+    /** Held until explicitly cleared, so the UI can actually show it. */
+    @Volatile
+    private var lastError: PlaybackException? = null
+
+    fun clearError() {
+        lastError = null
+        publish()
     }
 
     private val unplayable = mutableSetOf<String>()
 
     fun unplayableMediaIds(): Set<String> = unplayable.toSet()
 
-    private fun publish(error: PlaybackException? = null) {
+    /**
+ * Invoked by the service when a session custom command arrives, so the mutation goes
+ * through the engine rather than being acknowledged and dropped.
+ */
+fun publishCommandResult(customAction: String) {
+    when (customAction) {
+        NoizCommands.ACTION_SHUFFLE -> setShuffleModeEnabled(!shuffleModeEnabled)
+        NoizCommands.ACTION_REPEAT -> setRepeatMode(nextRepeatMode())
+    }
+}
+
+private fun nextRepeatMode(): Int = when (repeatMode) {
+    Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+    Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+    else -> Player.REPEAT_MODE_OFF
+}
+
+/** Cycles Off → All → One → Off, used by the notification and the Now Playing screen. */
+fun cycleRepeatMode() = setRepeatMode(nextRepeatMode())
+
+private fun publish() {
         val duration = when (val d = active.duration) {
             C.TIME_UNSET -> queue.getOrNullSafe(index)?.durationMs ?: 0L
             else -> d
@@ -477,17 +627,21 @@ class DualPlayerEngine(
             bufferedPositionMs = active.bufferedPosition.coerceAtLeast(0L),
             durationMs = duration,
             isPlaying = active.isPlaying,
+            // `isPlaying` is false while buffering; `playWhenReady` stays true. Reporting
+            // one as the other made the notification and Android Auto flash "paused" on
+            // every rebuffer and drop the foreground service.
+            playWhenReady = active.playWhenReady,
             playbackState = active.playbackState,
             mode = if (crossfadeMs == 0L) PlaybackMode.Gapless else PlaybackMode.Dual,
             shuffleModeEnabled = shuffleModeEnabled,
             repeatMode = repeatMode,
-            error = error,
+            error = lastError,
         )
     }
 
     init {
-        primary.addListener(listener)
-        secondary.addListener(listener)
+        primary.addListener(primaryListener)
+        secondary.addListener(secondaryListener)
         primary.repeatMode = Player.REPEAT_MODE_OFF
         primary.volume = volume
         secondary.volume = 0f
@@ -496,8 +650,8 @@ class DualPlayerEngine(
     fun release() {
         cancelCrossfade()
         stopMonitor()
-        primary.removeListener(listener)
-        secondary.removeListener(listener)
+        primary.removeListener(primaryListener)
+        secondary.removeListener(secondaryListener)
         primary.release()
         secondary.release()
     }

@@ -60,6 +60,15 @@ abstract class NoizDatabase : RoomDatabase() {
     abstract fun searchDao(): SearchDao
     abstract fun mutationDao(): MutationDao
 
+    // Phase 2 additions: whole-table reads for the index rebuild, rendition lookup and
+    // non-paging observers. Declared here rather than folded into the original DAOs so
+    // the Phase 1 files stay untouched.
+    abstract fun trackExtraDao(): TrackExtraDao
+    abstract fun albumExtraDao(): AlbumExtraDao
+    abstract fun artistExtraDao(): ArtistExtraDao
+    abstract fun playlistExtraDao(): PlaylistExtraDao
+    abstract fun renditionDao(): RenditionDao
+
     companion object {
         const val NAME = "noiz.db"
 

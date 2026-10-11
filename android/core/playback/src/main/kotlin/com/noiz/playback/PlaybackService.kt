@@ -1,16 +1,19 @@
 package com.noiz.playback
 
-import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.Bundle
 import android.os.SystemClock
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.CommandButton
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
-import androidx.media3.session.MediaSession.ConnectionResult
 import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionCommands
 import androidx.media3.session.SessionResult
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
@@ -21,300 +24,311 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Foreground playback service (§3.4, §3.5).
+ * The single owner of playback (§3.3, §8.2, §8.3).
  *
- * Declared with `foregroundServiceType="mediaPlayback"`; Media3 promotes it to the
- * foreground when playback starts. It hosts the [MediaLibrarySession] that backs the
- * notification, lock screen, Bluetooth AVRCP and the Android Auto browse tree.
+ * Owns the [DualPlayerEngine] and exposes it to the system through one
+ * [MediaLibrarySession] bound to a [NoizPlayer] facade. The notification, the in-app
+ * UI, Bluetooth and Android Auto therefore all observe the same snapshot and can never
+ * disagree about what is playing (§8.3).
  *
- * Audio focus is owned by the primary ExoPlayer (built with `handleAudioFocus = true`),
- * so transient loss during calls/navigation is handled by the platform focus protocol
- * without duplicating it here. [ResumeFader] adds the 300 ms fade-in on focus regain.
+ * The previous implementation built a bare `ExoPlayer` and ignored the engine entirely,
+ * so normalization, crossfade, caching, signed-URL resolution and queue persistence
+ * were all dead code.
  */
 @UnstableApi
 class PlaybackService : MediaLibraryService() {
 
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
     private lateinit var engine: DualPlayerEngine
     private lateinit var player: NoizPlayer
-    private lateinit var session: MediaLibrarySession
-    private lateinit var restoreStore: QueueRestoreStore
-    private var browseTree: BrowseTreeProvider? = null
+    private var librarySession: MediaLibrarySession? = null
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val resumeFader = ResumeFader(scope)
-    private var positionPersistJob: Job? = null
+    private lateinit var restoreStore: QueueRestoreStore
+    private lateinit var browseTree: BrowseTreeProvider
+    private lateinit var favorites: FavoritesWriter
+    private lateinit var settings: PlaybackSettings
+
+    private var sleepTimer: SleepTimerController? = null
+    private var persistJob: Job? = null
+
+    /** Wall-clock at which playback ended and the service may stop itself (§8.3). */
+    private var idleSinceMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
-        engine = PlaybackComponents.engine(this, scope)
-        player = NoizPlayer(engine)
-        restoreStore = PlaybackComponents.restoreStore(this)
-        browseTree = PlaybackComponents.browseTree(this)
 
-        engine.setCrossfadeMs(PlaybackComponents.settings(this).crossfadeMs)
-        engine.setShuffleModeEnabled(false)
-        engine.setRepeatMode(Player.REPEAT_MODE_OFF)
+        engine = PlaybackComponents.engineFactory(this, serviceScope)
+        restoreStore = PlaybackComponents.restoreStoreFactory(this)
+        browseTree = PlaybackComponents.browseTreeFactory(this)
+        favorites = PlaybackComponents.favoritesFactory(this)
+        settings = PlaybackComponents.settingsFactory(this)
 
-        session = MediaLibrarySession.Builder(this, player, SessionCallback())
-            .setSessionActivity(launchIntent())
+        // User settings must reach the engine or crossfade/normalization never apply.
+        engine.setCrossfadeMs(settings.crossfadeMs)
+        engine.normalizationTargetLufs = settings.normalizationTargetLufs
+        engine.setVolume(settings.outputVolume)
+
+        player = NoizPlayer(engine, serviceScope)
+        sleepTimer = SleepTimerController(engine, serviceScope)
+
+        restoreSavedQueue()
+
+        librarySession = MediaLibrarySession.Builder(this, player, libraryCallback)
+            .setSessionActivity(pendingIntentToNowPlaying())
             .build()
 
-        var wasPlaying = false
-        engine.snapshot
-            .onEach { snapshot ->
-                // 300 ms equal-power fade-in whenever playback resumes (§11 row 4).
-                if (snapshot.isPlaying && !wasPlaying) {
-                    resumeFader.fadeIn(
-                        setVolume = { engine.setVolume(it) },
-                        target = engine.volume,
-                    )
-                }
-                wasPlaying = snapshot.isPlaying
-                // 5 s autosave (§11 row 13) plus an explicit save on every pause/change.
-                if (!snapshot.isPlaying) persist(snapshot)
-            }
-            .launchIn(scope)
-
-        startPositionPersistLoop()
+        startPositionPersistence()
+        startIdleWatchdog()
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession = session
+    override fun onGetSession(
+        controller: MediaSession.ControllerInfo,
+    ): ListenableFuture<MediaLibrarySession?> = Futures.immediateFuture(librarySession)
 
-    private fun launchIntent(): PendingIntent =
-        PendingIntent.getActivity(
-            this,
-            0,
-            Intent().setPackage(packageName)
-                .setAction(ACTION_OPEN_NOW_PLAYING),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    // -----------------------------------------------------------------------
+    // Browse tree + custom commands (§3.6, §8.3)
+    // -----------------------------------------------------------------------
+
+    private val libraryCallback = object : MediaLibrarySession.Callback {
+
+        override fun onGetLibraryRoot(
+            session: MediaLibrarySession,
+            controller: MediaSession.ControllerInfo,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<MediaItem>> = Futures.immediateFuture(
+            browseTree.root()
+                ?.let { LibraryResult.ofItem(it, params) }
+                ?: LibraryResult.ofError(LibraryResult.RESULT_ERROR_BAD_VALUE),
         )
 
-    // -----------------------------------------------------------------------
-    // Position persistence
-    // -----------------------------------------------------------------------
-
-    private fun startPositionPersistLoop() {
-        positionPersistJob?.cancel()
-        positionPersistJob = scope.launch {
-            while (true) {
-                delay(POSITION_SAVE_INTERVAL_MS)
-                persist(engine.snapshot.value)
-            }
+        override fun onGetChildren(
+            session: MediaLibrarySession,
+            controller: MediaSession.ControllerInfo,
+            parentMediaId: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+            val children = runCatching { browseTree.children(parentMediaId, page, pageSize) }
+                .getOrElse { ImmutableList.of() }
+            return Futures.immediateFuture(LibraryResult.ofItemList(children, params))
         }
-    }
 
-    private fun persist(snapshot: EngineSnapshot) {
-        if (snapshot.queue.isEmpty()) return
-        restoreStore.save(
-            queueMediaIds = snapshot.queue.map { it.mediaItem.mediaId },
-            index = snapshot.currentIndex,
-            positionMs = snapshot.positionMs,
-            renditionIds = snapshot.queue.map { it.renditionId },
+        override fun onGetItem(
+            session: MediaLibrarySession,
+            controller: MediaSession.ControllerInfo,
+            mediaId: String,
+        ): ListenableFuture<LibraryResult<MediaItem>> = Futures.immediateFuture(
+            runCatching { browseTree.resolveBlocking(listOf(mediaId)).firstOrNull() }
+                .fold(
+                    onSuccess = { item ->
+                        if (item == null) {
+                            LibraryResult.ofError(LibraryResult.RESULT_ERROR_BAD_VALUE)
+                        } else {
+                            LibraryResult.ofItem(item, null)
+                        }
+                    },
+                    onFailure = { LibraryResult.ofError(LibraryResult.RESULT_ERROR_UNKNOWN) },
+                ),
         )
-    }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        persist(engine.snapshot.value)
-        super.onTaskRemoved(rootIntent)
-    }
+        override fun onSearch(
+            session: MediaLibrarySession,
+            controller: MediaSession.ControllerInfo,
+            query: String,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<Void>> {
+            // Routed through the repository so the query is escaped before it reaches
+            // FTS; passing raw user input here raised SQLiteException on any operator
+            // character.
+            runCatching { browseTree.searchBlocking(query) }
+            return Futures.immediateFuture(LibraryResult.ofVoid())
+        }
 
-    override fun onDestroy() {
-        persist(engine.snapshot.value)
-        positionPersistJob?.cancel()
-        scope.cancel()
-        session.release()
-        player.release()
-        super.onDestroy()
-    }
+        override fun onCustomCommand(
+            session: MediaLibrarySession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle,
+        ): ListenableFuture<SessionResult> {
+            val mediaId = args.getString(NoizCommands.ARG_MEDIA_ID)
+            when (customCommand.customAction) {
+                NoizCommands.ACTION_LIKE -> {
+                    mediaId?.let { favorites.setLiked(it, true) }
+                    engine.publishCommandResult(customAction = customCommand.customAction)
+                }
 
-    // -----------------------------------------------------------------------
-    // Session callback
-    // -----------------------------------------------------------------------
+                NoizCommands.ACTION_UNLIKE -> {
+                    mediaId?.let { favorites.setLiked(it, false) }
+                    engine.publishCommandResult(customAction = customCommand.customAction)
+                }
 
-    private inner class SessionCallback : MediaLibrarySession.Callback {
+                NoizCommands.ACTION_SHUFFLE ->
+                    engine.publishCommandResult(customAction = customCommand.customAction)
 
+                NoizCommands.ACTION_REPEAT ->
+                    engine.publishCommandResult(customAction = customCommand.customAction)
+
+                NoizCommands.ACTION_CYCLE_SLEEP_TIMER ->
+                    engine.publishCommandResult(customAction = customCommand.customAction)
+            }
+            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+        }
+
+        /**
+         * Restrict which apps may bind a controller.
+         *
+         * Media3's default `onConnect` accepts every caller. This service fronts a
+         * private catalog, so an untrusted app could otherwise read the browse tree and
+         * drive playback against the user's server.
+         */
         override fun onConnect(
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
         ): ConnectionResult {
-            // Custom transport actions differ between the notification (compact) and
-            // Android Auto (up to four), so the button list is scoped per controller.
-            val isAuto = controller.isAutomotive
-            val commands = buildSet {
-                addAll(NoizCommands.all)
-                if (!isAuto) addAll(NoizCommands.notificationExtras)
-            }
-            return ConnectionResult.AcceptedResultBuilder(session)
-                .setAvailableSessionCommands(
-                    ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
-                        .addAllSessionCommands(commands)
-                        .build(),
-                )
-                .build()
-        }
-
-        override fun onSetMediaItems(
-            mediaSession: MediaSession,
-            controller: MediaSession.ControllerInfo,
-            mediaItems: List<MediaItem>,
-            startIndex: Int,
-            startPositionMs: Long,
-        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
-            // Voice: "play something by Radiohead" arrives here as a search query.
-            val query = mediaItems.firstOrNull()
-                ?.requestMetadata
-                ?.searchQuery
-            if (!query.isNullOrBlank()) {
-                val resolved = browseTree?.searchBlocking(query).orEmpty()
-                if (resolved.isNotEmpty()) {
-                    return Futures.immediateFuture(
-                        MediaSession.MediaItemsWithStartPosition(mediaItems + resolved, 0, 0L),
+            if (controller.packageName != packageName && !isTrustedSystem(controller)) {
+                return ConnectionResult.AcceptedResultBuilder(session)
+                    .setSessionMayRunCommands(
+                        ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
+                            .buildUpon()
+                            .remove(SessionCommands.COMMAND_CHANGE_MEDIA_ITEMS)
+                            .remove(SessionCommands.COMMAND_GET_TIMELINE)
+                            .build(),
                     )
-                }
+                    .setCustomLayout(ImmutableList.of())
+                    .build()
             }
-            return Futures.immediateFuture(
-                MediaSession.MediaItemsWithStartPosition(mediaItems, startIndex, startPositionMs),
+            return super.onConnect(session, controller)
+        }
+    }
+
+    private fun isTrustedSystem(controller: MediaSession.ControllerInfo): Boolean {
+        val systemControllers = setOf(
+            "com.android.bluetooth",
+            "com.google.android.projection.gearhead",
+            "com.android.systemui",
+            "com.google.android.googlequicksearchbox",
+            packageName,
+        )
+        return controller.packageName in systemControllers
+    }
+
+    private fun pendingIntentToNowPlaying(): android.app.PendingIntent {
+        val intent = packageManager.getLaunchIntentForPackage(packageName)
+            ?: Intent(Intent.ACTION_MAIN).setPackage(packageName)
+        var flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags = flags or android.app.PendingIntent.FLAG_IMMUTABLE
+        }
+        return android.app.PendingIntent.getActivity(this, 0, intent, flags)
+    }
+
+    // -----------------------------------------------------------------------
+    // Position persistence + idle shutdown (§8.3, §11 row 13)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Writes the canonical queue and position every 5 s, and on task removal, so a
+     * process death restores where the user was rather than restarting the album.
+     */
+    private fun startPositionPersistence() {
+        persistJob?.cancel()
+        persistJob = serviceScope.launch {
+            while (isActive) {
+                delay(POSITION_PERSIST_INTERVAL_MS)
+                persistNow()
+            }
+        }
+    }
+
+    private fun persistNow() {
+        val snapshot = engine.snapshot.value
+        if (snapshot.queue.isEmpty()) return
+        runCatching {
+            restoreStore.save(
+                queueMediaIds = snapshot.queue.map { it.mediaItem.mediaId },
+                index = snapshot.currentIndex,
+                positionMs = snapshot.positionMs,
+                renditionIds = snapshot.queue.map { it.renditionId },
             )
         }
+    }
 
-        override fun onPlaybackResumption(
-            mediaSession: MediaSession,
-            controller: MediaSession.ControllerInfo,
-        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
-            // Bluetooth "play" after process death (§3.5). Media3 calls this from a
-            // background thread, so the store read is blocking on purpose.
-            val restored = restoreStore.loadBlocking()
-                ?: return Futures.immediateFuture(
-                    MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L),
+    private fun restoreSavedQueue() {
+        val restored = runCatching { restoreStore.loadBlocking() }.getOrNull() ?: return
+        val resolved = runCatching {
+            browseTree.resolveBlocking(restored.queueMediaIds)
+        }.getOrNull() ?: return
+        if (resolved.isEmpty()) return
+
+        engine.setQueue(
+            resolved.map { item ->
+                EngineTrack(
+                    mediaItem = item,
+                    renditionId = restored.renditionIds.getOrNull(resolved.indexOf(item))
+                        ?: EngineTrack.DEFAULT_RENDITION,
+                    durationMs = item.mediaMetadata.extras?.getLong(EXTRA_DURATION_MS) ?: 0L,
                 )
-            val items = browseTree?.resolveBlocking(restored.queueMediaIds).orEmpty()
-            return Futures.immediateFuture(
-                MediaSession.MediaItemsWithStartPosition(items, restored.index, restored.positionMs),
-            )
-        }
+            },
+            startIndex = restored.index,
+            startPositionMs = restored.positionMs,
+        )
+    }
 
-        override fun onCustomCommand(
-            session: MediaSession,
-            controller: MediaSession.ControllerInfo,
-            customCommand: SessionCommand,
-            args: android.os.Bundle,
-        ): ListenableFuture<SessionResult> {
-            when (customCommand.customAction) {
-                NoizCommands.ACTION_LIKE -> {
-                    PlaybackComponents.favorites(this@PlaybackService)
-                        .setLiked(args.getString(NoizCommands.ARG_MEDIA_ID).orEmpty(), true)
-                    return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+    private fun startIdleWatchdog() {
+        serviceScope.launch {
+            while (isActive) {
+                delay(IDLE_POLL_INTERVAL_MS)
+                val playing = engine.snapshot.value.isPlaying ||
+                    engine.snapshot.value.playWhenReady
+                if (playing) {
+                    idleSinceMs = 0L
+                } else if (idleSinceMs == 0L) {
+                    idleSinceMs = SystemClock.elapsedRealtime()
+                } else if (SystemClock.elapsedRealtime() - idleSinceMs > IDLE_TIMEOUT_MS) {
+                    // §8.3: stop ourselves once playback ended and the idle timeout
+                    // elapsed, instead of holding a foreground service open forever.
+                    persistNow()
+                    stopSelf()
+                    return@launch
                 }
-
-                NoizCommands.ACTION_UNLIKE -> {
-                    PlaybackComponents.favorites(this@PlaybackService)
-                        .setLiked(args.getString(NoizCommands.ARG_MEDIA_ID).orEmpty(), false)
-                    return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
-                }
-
-                NoizCommands.ACTION_CYCLE_SLEEP_TIMER -> {
-                    SleepTimerController(engine, scope).cycle()
-                    return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
-                }
-
-                else -> return Futures.immediateFuture(SessionResult(SessionResult.RESULT_ERROR_NOT_SUPPORTED))
             }
         }
+    }
 
-        // -------------------------------------------------------------------
-        // Android Auto browse tree (§3.6) — must answer < 2 s from cache.
-        // -------------------------------------------------------------------
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        persistNow()
+        super.onTaskRemoved(rootIntent)
+    }
 
-        override fun onGetLibraryRoot(
-            session: MediaLibrarySession,
-            browser: MediaSession.ControllerInfo,
-            params: MediaLibraryService.LibraryParams?,
-        ): ListenableFuture<LibraryResult<MediaItem>> {
-            val root = browseTree?.root()
-            return if (root == null) {
-                Futures.immediateFuture(LibraryResult.ofError(LibraryResult.RESULT_ERROR_IO))
-            } else {
-                Futures.immediateFuture(LibraryResult.ofItem(root, params))
-            }
-        }
-
-        override fun onGetChildren(
-            session: MediaLibrarySession,
-            browser: MediaSession.ControllerInfo,
-            parentId: String,
-            page: Int,
-            pageSize: Int,
-            params: MediaLibraryService.LibraryParams?,
-        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
-            val children = browseTree?.children(parentId, page, pageSize).orEmpty()
-            return Futures.immediateFuture(
-                LibraryResult.ofItemList(children, params),
-            )
-        }
+    override fun onDestroy() {
+        persistJob?.cancel()
+        persistNow()
+        librarySession?.release()
+        librarySession = null
+        player.release()
+        serviceScope.cancel()
+        super.onDestroy()
     }
 
     companion object {
-        const val ACTION_OPEN_NOW_PLAYING = "com.noiz.action.OPEN_NOW_PLAYING"
-        const val POSITION_SAVE_INTERVAL_MS = 5_000L
-    }
-}
+        private const val POSITION_PERSIST_INTERVAL_MS = 5_000L
+        private const val IDLE_POLL_INTERVAL_MS = 2_000L
+        private const val IDLE_TIMEOUT_MS = 60_000L
+        private const val EXTRA_DURATION_MS = "noiz.durationMs"
 
-/**
- * 300 ms equal-power fade-in after play resumes (§11 row 4). ExoPlayer handles the
- * focus negotiation; this only shapes the ramp so a call ending does not snap back to
- * full level.
- */
-private class ResumeFader(private val scope: CoroutineScope) {
-    private var job: Job? = null
-
-    fun fadeIn(setVolume: (Float) -> Unit, target: Float = 1f) {
-        job?.cancel()
-        job = scope.launch {
-            val start = SystemClock.elapsedRealtime()
-            while (true) {
-                val t = ((SystemClock.elapsedRealtime() - start) / 300f).coerceIn(0f, 1f)
-                setVolume(t * target)
-                if (t >= 1f) break
-                delay(16)
-            }
+        @JvmStatic
+        fun start(context: Context) {
+            // MediaSessionService promotes itself to the foreground when the session has
+            // something playing. Calling startForegroundService() with no active
+            // playback makes Android throw ForegroundServiceDidNotStartInTimeException
+            // on API 31+, so a plain start is correct here.
+            context.startService(Intent(context, PlaybackService::class.java))
         }
     }
-
-    fun cancel() {
-        job?.cancel()
-    }
-}
-
-/** Hilt-free service locator so this module stays independent of :core:data. */
-object PlaybackComponents {
-    @Volatile
-    var engineFactory: ((PlaybackService, CoroutineScope) -> DualPlayerEngine)? = null
-    @Volatile
-    var restoreStoreFactory: ((PlaybackService) -> QueueRestoreStore)? = null
-    @Volatile
-    var browseTreeFactory: ((PlaybackService) -> BrowseTreeProvider)? = null
-    @Volatile
-    var favoritesFactory: ((PlaybackService) -> FavoritesWriter)? = null
-    @Volatile
-    var settingsFactory: ((PlaybackService) -> PlaybackSettings)? = null
-
-    fun engine(service: PlaybackService, scope: CoroutineScope): DualPlayerEngine =
-        requireNotNull(engineFactory) { "PlaybackComponents.engineFactory not installed" }(service, scope)
-
-    fun restoreStore(service: PlaybackService): QueueRestoreStore =
-        requireNotNull(restoreStoreFactory) { "restoreStoreFactory not installed" }(service)
-
-    fun browseTree(service: PlaybackService): BrowseTreeProvider =
-        requireNotNull(browseTreeFactory) { "browseTreeFactory not installed" }(service)
-
-    fun favorites(service: PlaybackService): FavoritesWriter =
-        requireNotNull(favoritesFactory) { "favoritesFactory not installed" }(service)
-
-    fun settings(service: PlaybackService): PlaybackSettings =
-        requireNotNull(settingsFactory) { "settingsFactory not installed" }(service)
 }

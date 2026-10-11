@@ -96,6 +96,13 @@ interface PlaylistDao {
     @Query("SELECT positionKey FROM playlist_entry WHERE playlistId = :playlistId AND deleted = 0 ORDER BY positionKey COLLATE BINARY LIMIT 1")
     suspend fun firstPositionKey(playlistId: String): String?
 
+    /**
+     * The *highest* position key, i.e. the current tail. Appending after `firstPositionKey`
+     * (the lowest key) inserted new tracks at position 2 instead of the end.
+     */
+    @Query("SELECT positionKey FROM playlist_entry WHERE playlistId = :playlistId AND deleted = 0 ORDER BY positionKey COLLATE BINARY DESC LIMIT 1")
+    suspend fun lastPositionKey(playlistId: String): String?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertEntry(entry: PlaylistEntryEntity)
 
@@ -115,6 +122,15 @@ interface DownloadDao {
     @Query("SELECT * FROM download WHERE state = :state")
     fun observeByState(state: DownloadState): Flow<List<DownloadEntity>>
 
+    /**
+     * Every download row regardless of state.
+     *
+     * Observing only COMPLETED hid queued/failed downloads from the UI, so the retry
+     * state and failure reason written by the progress recorder were never shown.
+     */
+    @Query("SELECT * FROM download ORDER BY trackId ASC")
+    fun observeAll(): Flow<List<DownloadEntity>>
+
     @Query("SELECT * FROM download WHERE trackId = :trackId")
     suspend fun byTrack(trackId: String): DownloadEntity?
 
@@ -126,6 +142,10 @@ interface DownloadDao {
 
     @Query("UPDATE download SET state = :state, bytesDone = :bytesDone WHERE trackId = :trackId")
     suspend fun updateProgress(trackId: String, state: DownloadState, bytesDone: Long)
+
+    /** State-only transition; keeps `bytesDone` so a resume does not rewind the UI. */
+    @Query("UPDATE download SET state = :state WHERE trackId = :trackId")
+    suspend fun setState(trackId: String, state: DownloadState)
 
     /** LRU eviction of unpinned downloads when the storage cap is reached (§11 row 11). */
     @Query(
@@ -151,7 +171,12 @@ interface OutboxDao {
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insert(op: OutboxEntity)
 
-    @Query("SELECT * FROM outbox ORDER BY createdAt ASC LIMIT :limit")
+    /**
+     * Oldest-first in HLC order, which is the causal order. `createdAt` is
+     * millisecond-resolution, so two ops written in the same millisecond flushed in
+     * whatever order SQLite returned, breaking last-writer-wins determinism (§8.4).
+     */
+    @Query("SELECT * FROM outbox ORDER BY hlc COLLATE BINARY ASC, createdAt ASC LIMIT :limit")
     suspend fun nextBatch(limit: Int): List<OutboxEntity>
 
     @Query("SELECT COUNT(*) FROM outbox")
@@ -176,7 +201,29 @@ interface PlayEventDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(event: PlayEventEntity)
 
-    @Query("SELECT * FROM play_event WHERE synced = 0 ORDER BY startedAt ASC LIMIT :limit")
+    /**
+     * Upserts progress onto an existing unsynced event. An INSERT with the same primary
+     * key is ignored by the IGNORE strategy, so progress updates were silently dropped
+     * and every event shipped with `played_ms: 0`.
+     *
+     * Only touches rows that have not synced yet — a late progress update must never
+     * resurrect an event the server has already acknowledged.
+     */
+    @Query(
+        """
+        UPDATE play_event SET
+            playedMs = MAX(playedMs, :playedMs),
+            endedReason = COALESCE(:endedReason, endedReason)
+        WHERE id = :id AND synced = 0
+        """,
+    )
+    suspend fun updateProgress(id: String, playedMs: Int, endedReason: String?)
+
+    /**
+     * Private sessions are recorded locally but never uploaded (§6.6 / §13). Without the
+     * `private = 0` filter the worker shipped private listening history to the server.
+     */
+    @Query("SELECT * FROM play_event WHERE synced = 0 AND private = 0 ORDER BY startedAt ASC LIMIT :limit")
     suspend fun unsynced(limit: Int = 200): List<PlayEventEntity>
 
     @Query("UPDATE play_event SET synced = 1 WHERE id IN (:ids)")
@@ -185,9 +232,13 @@ interface PlayEventDao {
     @Query("SELECT * FROM play_event WHERE private = 0 ORDER BY startedAt DESC LIMIT :limit")
     fun history(limit: Int = 500): Flow<List<PlayEventEntity>>
 
-    /** Private session history is never uploaded; drop un-synced rows on toggle-off. */
-    @Query("DELETE FROM play_event WHERE private = 1 AND synced = 0")
-    suspend fun discardPrivateUnsynced()
+    /**
+     * Turning privacy on must drop every event still queued for upload — including ones
+     * recorded before the toggle. Dropping only `private = 1` rows left previously
+     * queued events free to upload.
+     */
+    @Query("DELETE FROM play_event WHERE synced = 0")
+    suspend fun discardUnsynced()
 }
 
 @Dao
@@ -237,7 +288,7 @@ interface SearchDao {
         """
         SELECT * FROM search_index
         WHERE search_index MATCH :query
-        ORDER BY rowid
+        ORDER BY docid
         LIMIT :limit
         """,
     )
@@ -304,6 +355,24 @@ abstract class MutationDao {
 
     @Query("UPDATE playlist_entry SET positionKey = :positionKey WHERE playlistId = :playlistId AND entryId = :entryId")
     abstract suspend fun moveEntryInternal(playlistId: String, entryId: String, positionKey: String)
+
+    /**
+     * Tombstone + outbox op in one transaction. Doing these as two separate calls meant
+     * a crash in between could drop the removal entirely (no local change, no op) or
+     * enqueue an edit the local database never applied.
+     */
+    @Transaction
+    open suspend fun removeEntryWithOutbox(
+        playlistId: String,
+        entryId: String,
+        op: OutboxEntity,
+    ) {
+        tombstoneEntryInternal(playlistId, entryId)
+        insertOutboxInternal(op)
+    }
+
+    @Query("UPDATE playlist_entry SET deleted = 1 WHERE playlistId = :playlistId AND entryId = :entryId")
+    abstract suspend fun tombstoneEntryInternal(playlistId: String, entryId: String)
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     abstract suspend fun insertOutboxInternal(op: OutboxEntity)

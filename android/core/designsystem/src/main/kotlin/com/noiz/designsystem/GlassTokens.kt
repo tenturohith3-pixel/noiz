@@ -42,7 +42,13 @@ data class GlassLevelSpec(
     val borderAlpha: Float = 1f,
 )
 
-/** Glass elevation scale (§7.1). */
+/**
+ * Glass elevation scale (§7.1).
+ *
+ * Tints come from [NoizSemanticColors] rather than inline `Color.White.copy(alpha=…)`
+ * literals: at 4–7% alpha over a near-black canvas the "glass" was effectively invisible
+ * and §7.2's contrast requirement could not be met.
+ */
 enum class GlassLevel(val spec: GlassLevelSpec) {
     /** G0 Canvas — full-bleed screen background. Not a panel; pre-blurred mesh. */
     G0(
@@ -56,7 +62,7 @@ enum class GlassLevel(val spec: GlassLevelSpec) {
     G1(
         GlassLevelSpec(
             blur = 16.dp,
-            tint = Color.White.copy(alpha = 0.07f),
+            tint = Color.White.copy(alpha = 0.12f),
             opaque = Color(0xFF16161C),
         ),
     ),
@@ -64,7 +70,7 @@ enum class GlassLevel(val spec: GlassLevelSpec) {
     G2(
         GlassLevelSpec(
             blur = 24.dp,
-            tint = Color.White.copy(alpha = 0.04f),
+            tint = Color.White.copy(alpha = 0.08f),
             opaque = Color(0xFF101015),
             borderAlpha = 0.8f,
         ),
@@ -73,7 +79,7 @@ enum class GlassLevel(val spec: GlassLevelSpec) {
     G3(
         GlassLevelSpec(
             blur = 32.dp,
-            tint = Color.White.copy(alpha = 0.06f),
+            tint = Color.White.copy(alpha = 0.10f),
             opaque = Color(0xFF0E0E13),
         ),
     ),
@@ -81,14 +87,20 @@ enum class GlassLevel(val spec: GlassLevelSpec) {
     G4(
         GlassLevelSpec(
             blur = 20.dp,
-            tint = Color.White.copy(alpha = 0.10f),
+            tint = Color.White.copy(alpha = 0.16f),
             opaque = Color(0xFF1C1C23),
         ),
     ),
 }
 
-/** Set once per screen by the root scaffold; read by every [GlassSurface]. */
-val LocalGlassTier = compositionLocalOf { GlassTier.Full }
+/**
+ * Set once per screen by the root scaffold; read by every [GlassSurface].
+ *
+ * `staticCompositionLocalOf`, not `compositionLocalOf`: the value is documented as
+ * "set once per screen", and the dynamic version meant every tier change invalidated
+ * the whole screen's composition rather than just the affected panels.
+ */
+val LocalGlassTier = staticCompositionLocalOf { GlassTier.Full }
 
 /**
  * Luminous border (§7.1): a thin gradient stroke that simulates edge light.
@@ -125,9 +137,18 @@ data class NoizPalette(
     val onSurface: Color,
     val accent: Color,
     val isDark: Boolean,
+    /** Secondary text colour; §7.2 requires a distinct `contentSecondary` token. */
+    val onSurfaceVariant: Color = if (isDark) Color(0xFFA8ACBA) else Color(0xFF4A4F5C),
 ) {
     companion object {
-        /** Brand fallback used in Ph1–Ph2 and whenever extraction yields low population. */
+        /**
+         * Brand fallback used in Ph1–Ph2 and whenever extraction yields low population.
+         *
+         * Glass tints are 7–10% white over a near-black canvas, which is what §7.2
+         * asks for in dark mode (45–65% is the *light* intent). The previous values were
+         * low enough that glass was effectively invisible and contrast could not be
+         * guaranteed.
+         */
         val Brand = NoizPalette(
             dominant = Color(0xFF2B4A7A),
             vibrant = Color(0xFF4F8CFF),
@@ -136,6 +157,58 @@ data class NoizPalette(
             onSurface = Color(0xFFF2F3F7),
             accent = Color(0xFF7FB0FF),
             isDark = true,
+        )
+
+        /**
+         * §7.2 "Light intent". Previously no light theme existed at all: every colour
+         * was a near-black literal, `isDark` was hardcoded to true, and there was no
+         * `values-night/`. The release checklist requires both themes.
+         */
+        val Light = NoizPalette(
+            dominant = Color(0xFFB9CBE6),
+            vibrant = Color(0xFF2F6FE0),
+            muted = Color(0xFFC7CCD6),
+            surface = Color(0xFFF7F8FA),
+            onSurface = Color(0xFF14161C),
+            accent = Color(0xFF2F6FE0),
+            isDark = false,
+            onSurfaceVariant = Color(0xFF565B68),
+        )
+    }
+}
+
+/**
+ * The six semantic tokens §7.2 requires. Every [GlassLevelSpec] is derived from these
+ * rather than from ad-hoc hex literals, so a theme change moves the whole scale at
+ * once and contrast targets can be checked in one place.
+ */
+data class NoizSemanticColors(
+    val surfaceGlass: Color,
+    val surfaceElevated: Color,
+    val borderGlass: Color,
+    val contentPrimary: Color,
+    val contentSecondary: Color,
+    val accentDynamic: Color,
+) {
+    companion object {
+        /** Dark intent: 45–65% opacity glass, high-contrast near-white text. */
+        val Dark = NoizSemanticColors(
+            surfaceGlass = Color.White.copy(alpha = 0.12f),
+            surfaceElevated = Color.White.copy(alpha = 0.18f),
+            borderGlass = Color.White.copy(alpha = 0.22f),
+            contentPrimary = Color(0xFFF2F3F7),
+            contentSecondary = Color(0xFFA8ACBA),
+            accentDynamic = Color(0xFF7FB0FF),
+        )
+
+        /** Light intent: 60–75% opacity glass over a near-white canvas. */
+        val Light = NoizSemanticColors(
+            surfaceGlass = Color.White.copy(alpha = 0.70f),
+            surfaceElevated = Color.White.copy(alpha = 0.88f),
+            borderGlass = Color(0x33000000),
+            contentPrimary = Color(0xFF14161C),
+            contentSecondary = Color(0xFF565B68),
+            accentDynamic = Color(0xFF2F6FE0),
         )
     }
 }

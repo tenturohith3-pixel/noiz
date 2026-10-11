@@ -98,12 +98,21 @@ def install_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # `exc.errors()` entries carry the submitted `input`, which on /auth/login is
+        # the plaintext password, and `ctx` may hold exception objects that json.dumps
+        # cannot encode (raising a second 500 from inside this handler). Report the
+        # location and type only.
         return _problem(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             title="Validation Failed",
             detail="One or more request fields are invalid.",
             instance=str(request.url.path),
-            extra={"errors": exc.errors()},
+            extra={
+                "errors": [
+                    {"loc": list(e.get("loc", ())), "msg": str(e.get("msg", "")), "type": str(e.get("type", ""))}
+                    for e in exc.errors()
+                ],
+            },
         )
 
     @app.exception_handler(Exception)
@@ -111,12 +120,16 @@ def install_exception_handlers(app: FastAPI) -> None:
         # Never leak a stack trace to a client; the request id ties it to the log line.
         request_id = getattr(request.state, "request_id", "unknown")
         logger.exception("unhandled error request_id=%s path=%s", request_id, request.url.path)
+        # ServerErrorMiddleware sits *outside* user middleware, so request_context's
+        # header injection never runs for this path. Add the headers here so every
+        # response still carries a request id (§10).
         return _problem(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             title="Internal Server Error",
             detail="The server failed to handle this request.",
             instance=str(request.url.path),
             extra={"request_id": request_id},
+            headers={"X-Request-Id": request_id} if request_id != "unknown" else None,
         )
 
 
@@ -142,7 +155,10 @@ def _title_for(status_code: int) -> str:
 
 async def request_context(request: Request, call_next):  # type: ignore[no-untyped-def]
     """Adds a request id and a monotonic timer used for the p95 latency budget."""
-    request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
+    # Never trust a client-supplied id: Starlette's MutableHeaders encodes with
+    # latin-1 and does not filter CR/LF, so an arbitrary header value could inject
+    # extra headers in front of a non-normalising proxy — and it lands in the logs.
+    request_id = _client_request_id(request.headers.get("X-Request-Id")) or uuid.uuid4().hex
     request.state.request_id = request_id
     started = time.perf_counter()
 
@@ -153,6 +169,18 @@ async def request_context(request: Request, call_next):  # type: ignore[no-untyp
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _client_request_id(raw: str | None) -> str | None:
+    """Returns the client's id only when it is a well-formed, log-safe token."""
+    if not raw:
+        return None
+    candidate = raw.strip()
+    if len(candidate) > 64:
+        return None
+    if not all(ch.isalnum() or ch in "-_." for ch in candidate):
+        return None
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +198,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
         docs_url="/docs" if resolved.debug else None,
         redoc_url=None,
-        openapi_url="/openapi.json",
+        # Exposing the schema in production hands out the complete route inventory.
+        openapi_url="/openapi.json" if resolved.debug else None,
     )
     app.state.settings = resolved
 

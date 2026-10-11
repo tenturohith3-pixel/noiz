@@ -20,6 +20,8 @@ build/
 # --- android / jvm ---------------------------------------------------------
 .gradle/
 build/
+# NOTE: the negation above is a no-op unless a prior rule matches `*.jar`. Keep it
+# anyway so the wrapper jar is never ignored by a future blanket rule.
 !android/gradle/wrapper/gradle-wrapper.jar
 local.properties
 .cxx/
@@ -29,6 +31,7 @@ local.properties
 captures/
 .externalNativeBuild/
 kotlin-js-store/
+.kotlin/
 
 # --- misc ------------------------------------------------------------------
 .DS_Store
@@ -37,3 +40,5 @@ Thumbs.db
 *.iml
 .vscode/
 *.log
+*.zip
+*.whl

@@ -26,11 +26,14 @@ enum class GlassTierConstraint { BatterySaver, ThermalModerate, ThermalSevere, R
 /**
  * Chooses the glass tier at launch and re-evaluates it live (§7.2).
  *
- *  Full   — API ≥ 31 and (MEDIA_PERFORMANCE_CLASS ≥ 31 or measured healthy frames)
- *  Static — > 12% janky frames over a 5 s window, thermal ≥ MODERATE, or user override
- *  Opaque — Battery Saver, thermal ≥ SEVERE, "Reduce transparency", "High contrast"
+ *  Full   — API >= 31 and (MEDIA_PERFORMANCE_CLASS >= 31 or measured healthy frames)
+ *  Static — > 12% janky frames over a 5 s window, thermal >= MODERATE, or user override
+ *  Opaque — Battery Saver, thermal >= SEVERE, "Reduce transparency", "High contrast"
  *
  * Transitions cross-fade over 300 ms in the UI layer and never interrupt playback.
+ *
+ * The platform signals (battery saver, thermal, reduce-transparency) must be pushed in
+ * by the host via [setConstraint]; `:app` wires the corresponding listeners.
  */
 class GlassTierController(
     private val appContext: Context,
@@ -115,7 +118,7 @@ class GlassTierController(
         val am = appContext.getSystemService<AccessibilityManager>()
         am?.let { manager ->
             val extra = buildSet {
-                if (manager.isHighTextContrastEnabled) add(GlassTierConstraint.HighContrast)
+                if (manager.isHighContrastTextEnabled) add(GlassTierConstraint.HighContrast)
             }
             if (extra.isNotEmpty()) constraints.value = constraints.value + extra
         }
@@ -134,11 +137,19 @@ class GlassTierController(
 
     private fun recompute() {
         val c = constraints.value
-        val next = when {
+        val requested = when {
             preference != GlassTierPreference.Auto -> preference.tierOrNull() ?: resolveAuto(c)
             else -> resolveAuto(c)
         }
-        _tier.value = next
+        // An explicit "Full" override bypassed hasCapableGpu(), so a persisted
+        // preference on Android 10/11 selected live RenderEffect blur — the exact
+        // per-device cost §7.3 rule 3 says to avoid. Clamp here rather than at each call
+        // site so no panel can opt back in.
+        _tier.value = if (requested == GlassTier.Full && !hasCapableGpu()) {
+            GlassTier.Static
+        } else {
+            requested
+        }
     }
 
     private fun resolveAuto(c: Set<GlassTierConstraint>): GlassTier {

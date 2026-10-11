@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Kept per-feature rather than only in :app so the module owns its own copy and
+      §13's "text is externalized from the beginning" holds at the source.
+      :app overrides these for the whole app if a shared wording is preferred.
+    -->
+    <string name="home_greeting_morning">Good morning</string>
+    <string name="home_greeting_afternoon">Good afternoon</string>
+    <string name="home_greeting_evening">Good evening</string>
+    <string name="home_nothing_playing">Nothing playing</string>
+
+    <string name="action_play">Play</string>
+    <string name="action_pause">Pause</string>
+    <string name="action_next">Next</string>
+    <string name="action_previous">Previous</string>
+    <string name="action_shuffle">Shuffle</string>
+    <string name="action_repeat">Repeat</string>
+    <string name="action_expand_now_playing">Expand now playing</string>
+    <string name="action_collapse_now_playing">Collapse now playing</string>
+    <string name="action_skip_forward">Skip forward 5 seconds</string>
+    <string name="action_skip_back">Skip back 5 seconds</string>
+    <string name="action_add_to_queue">Add to queue</string>
+
+    <string name="state_playing">Playing</string>
+    <string name="state_paused">Paused</string>
+    <string name="state_buffering">Buffering</string>
+    <string name="state_repeat_off">Repeat off</string>
+    <string name="state_repeat_all">Repeating all tracks</string>
+    <string name="state_repeat_one">Repeating this track</string>
+    <string name="state_shuffle_off">Shuffle off</string>
+    <string name="state_shuffle_on">Shuffle on</string>
+
+    <string name="cd_artwork_generic">Album artwork</string>
+    <string name="cd_artwork_for">Album artwork for %1$s</string>
+    <string name="cd_seek_bar">Playback position</string>
+    <string name="cd_time_elapsed_total">%1$s of %2$s</string>
+
+    <string name="home_shelf_recently_played">Recently played</string>
+    <string name="home_shelf_continue_listening">Continue listening</string>
+    <string name="home_shelf_new_additions">New additions</string>
+    <string name="home_shelf_for_you">For you</string>
+</resources>

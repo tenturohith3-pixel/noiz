@@ -2,6 +2,7 @@ package com.noiz.playback
 
 import android.net.Uri
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
@@ -22,8 +23,12 @@ class SignedUrlResolver(
         val uri = dataSpec.uri
         if (uri.scheme != NOIZ_SCHEME) return dataSpec
 
-        val trackId = uri.host ?: return dataSpec
-        val rendition = uri.lastPathSegment ?: RENDITION_ORIG
+        // `noiz://track/{trackId}/{rendition}` puts the literal "track" in `uri.host`,
+        // so reading the track id from `host` minted a signature for a track called
+        // "track" for every single item. The path segments carry the real values.
+        val segments = uri.pathSegments
+        val trackId = segments.getOrNull(0) ?: return dataSpec
+        val rendition = segments.getOrNull(1) ?: RENDITION_ORIG
 
         val cached = tokenStore.signatureFor(trackId, rendition)
         val signed = if (cached != null && !cached.isExpiringWithin(EXPIRY_SKEW_MS)) {
@@ -71,6 +76,8 @@ interface StreamManifestClient {
  */
 class NoizLoadErrorHandlingPolicy(
     private val isValidatedNetwork: () -> Boolean,
+    /** Drops a cached signature so the next resolve mints a fresh one. */
+    private val tokenStore: StreamTokenStore? = null,
 ) : DefaultLoadErrorHandlingPolicy() {
 
     override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
@@ -82,6 +89,38 @@ class NoizLoadErrorHandlingPolicy(
             // Keep the session alive; UI shows "Reconnecting…" on the seek bar.
             else -> LONG_RETRY_MS
         }
+    }
+
+    /**
+     * An expired or revoked signature must be re-minted, not retried. Media3 treats
+     * every status except 404/410 as retryable, so without this the same dead URL was
+     * retried up to 20 times and the track never recovered.
+     */
+    override fun shouldRetryLoadException(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Boolean {
+        val error = loadErrorInfo.error
+        if (error is HttpDataSource.InvalidResponseCodeException) {
+            when (error.responseCode) {
+                401, 403 -> {
+                    // Parse noiz://track/{id}/{rendition} to find which token died.
+                    val uri = error.uri
+                    if (uri.scheme == SignedUrlResolver.NOIZ_SCHEME) {
+                        val id = uri.pathSegments.getOrNull(0)
+                        val rendition = uri.pathSegments.getOrNull(1)
+                            ?: SignedUrlResolver.RENDITION_ORIG
+                        if (id != null) {
+                            tokenStore?.invalidate(id, rendition)
+                            return true
+                        }
+                    }
+                }
+
+                410 -> {
+                    // The rendition is gone for good; retrying cannot help.
+                    return false
+                }
+            }
+        }
+        return super.shouldRetryLoadException(loadErrorInfo)
     }
 
     override fun getMinimumLoadableRetryCount(dataType: Int): Int = MAX_RETRIES

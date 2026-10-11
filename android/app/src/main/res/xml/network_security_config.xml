@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  §4.3: all production traffic is TLS.
+
+  Two deliberate exceptions, both because the product is self-hosted:
+
+  1. Cleartext to private LAN ranges. A self-hosted noiz on `http://192.168.1.4:8000`
+     is the documented first-run case (§3.2), and `normalizeBaseUrl` accepts `http://`
+     input. Without these domains the app fails with
+     `CLEARTEXT communication ... not permitted` on exactly the deployment the README
+     tells people to run. Public hosts still require TLS.
+
+  2. Debug builds trust user-installed CAs, so a private CA can be exercised during
+     development. Release builds trust system CAs only.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <domain includeSubdomains="true">10.0.2.2</domain>
+        <!-- RFC1918: the operator's own network. -->
+        <domain includeSubdomains="true">192.168.0.0</domain>
+        <domain includeSubdomains="true">10.0.0.0</domain>
+        <domain includeSubdomains="true">172.16.0.0</domain>
+        <!-- .local is the mDNS name noiz uses on a LAN. -->
+        <domain includeSubdomains="true">local</domain>
+    </domain-config>
+
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>

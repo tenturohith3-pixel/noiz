@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Stylized "n" waveform mark. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FF7FB0FF"
+        android:pathData="M34,74 L34,34 L40,34 L68,62 L68,34 L74,34 L74,74 L68,74 L40,46 L40,74 Z" />
+</vector>

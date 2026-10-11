@@ -87,6 +87,20 @@ async def db_conn() -> AsyncIterator[asyncpg.Connection]:
 
 
 @asynccontextmanager
+async def short_lived_conn() -> AsyncIterator[asyncpg.Connection]:
+    """A connection that is released as soon as the `async with` block exits.
+
+    Use this instead of the `DbConn` dependency in any handler that returns a
+    `StreamingResponse`. FastAPI runs a yield-dependency's teardown *after* the
+    response body has been fully sent, so a `DbConn` handler pins a pooled connection
+    for the entire duration of a media transfer.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        yield conn
+
+
+@asynccontextmanager
 async def transaction() -> AsyncIterator[asyncpg.Connection]:
     """Explicit transaction for read-modify-write paths (playlist rebalancing)."""
     pool = get_pool()

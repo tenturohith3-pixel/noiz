@@ -1,97 +1,89 @@
 package com.noiz.playback
 
-import android.os.Looper
+import android.os.Bundle
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.SimpleBasePlayer
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.common.util.Util
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
 
 /**
- * A single logical [Player] presented to MediaSession, the notification, Android Auto
- * and the UI (§6.2).
+ * `SimpleBasePlayer` facade over [DualPlayerEngine] (§3.3).
  *
- * It computes one coherent State from the two ExoPlayers inside [engine], so nobody
- * above this class ever observes the crossfade swap. Command handling is delegated
- * back to the engine.
+ * One coherent `State` so MediaSession, the notification and Android Auto never see the
+ * dual-player swap: `getState()` reads [DualPlayerEngine.snapshot], and every handler
+ * delegates to the engine. The playlist view is the *canonical* queue, not whichever
+ * ExoPlayer happens to be loaded — that is what lets the UI reorder and remove items
+ * while gapless mode has the rest of the queue resident in the primary player.
+ *
+ * SimpleBasePlayer diffs consecutive `getState()` snapshots and emits the matching
+ * events itself, so state changes surface via a single [invalidateState] call whenever
+ * the engine snapshot changes.
  */
-@UnstableApi
 class NoizPlayer(
     private val engine: DualPlayerEngine,
-) : SimpleBasePlayer(Looper.getMainLooper()) {
+    scope: CoroutineScope,
+) : SimpleBasePlayer(android.os.Looper.getMainLooper()) {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-
-    private var playWhenReady: Boolean = false
-    private var playbackParameters: PlaybackParameters = PlaybackParameters.DEFAULT
-    private var repeatMode: Int = Player.REPEAT_MODE_OFF
-    private var shuffleModeEnabled: Boolean = false
-    private var volume: Float = 1f
-    private var released = false
-
-    init {
-        engine.snapshot
-            .onEach { invalidateState() }
-            .launchIn(scope)
+    // invalidateState() must run on the looper this facade was built with.
+    private val collectorJob = scope.launch {
+        require(scope.coroutineContext[kotlinx.coroutines.Job] != null) {
+            "NoizPlayer requires a scope with a Job so the collector can be cancelled"
+        }
+        engine.snapshot.collect { invalidateState() }
     }
 
-    // -----------------------------------------------------------------------
-    // State
-    // -----------------------------------------------------------------------
+    /** The engine's current state, for handler decisions. */
+    private val snapshot: EngineSnapshot get() = engine.snapshot.value
 
     override fun getState(): State {
-        val snap = engine.snapshot.value
+        val snapshot = engine.snapshot.value
 
-        val playlist: List<MediaItemData> = snap.queue.mapIndexed { i, track ->
-            MediaItemData.Builder(track.mediaItem.mediaId.ifEmpty { "noiz-item-$i" })
+        val items = snapshot.queue.map { track ->
+            MediaItemData.Builder(track.mediaItem.mediaId)
                 .setMediaItem(track.mediaItem)
-                .setDurationUs(
-                    if (track.durationMs > 0L) Util.msToUs(track.durationMs) else C.TIME_UNSET,
-                )
+                .setMediaMetadata(track.mediaItem.mediaMetadata)
+                .setDurationUs(if (track.durationMs > 0) track.durationMs * 1000 else C.TIME_UNSET)
                 .setIsSeekable(true)
-                .setIsDynamic(false)
                 .build()
         }
 
-        val builder = State.Builder()
-            .setAvailableCommands(ALL_COMMANDS)
-            .setPlaylist(playlist)
-            .setPlayWhenReady(playWhenReady, Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST)
-            .setPlaybackState(
-                if (released) Player.STATE_IDLE else snap.playbackState,
+        return State.Builder()
+            .setAvailableCommands(availableCommands)
+            // Engine state ints match Player.STATE_* / Player.REPEAT_MODE_*.
+            .setPlaybackState(snapshot.playbackState)
+            // `playWhenReady` stays true across a rebuffer, unlike `isPlaying`. Using
+            // the latter made MediaSession treat a buffering player as stopped and drop
+            // the foreground notification mid-track.
+            .setPlayWhenReady(
+                snapshot.playWhenReady,
+                Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST,
             )
-            .setPlaybackParameters(playbackParameters)
-            .setRepeatMode(repeatMode)
-            .setShuffleModeEnabled(shuffleModeEnabled)
-            .setVolume(volume)
-            .setContentPositionMs(if (playlist.isEmpty()) 0L else snap.positionMs)
-
-        if (playlist.isNotEmpty()) {
-            builder.setCurrentMediaItemIndex(snap.currentIndex.coerceIn(0, playlist.lastIndex))
-        }
-
-        return builder.build()
+            .setPlaylist(items)
+            .setCurrentMediaItemIndex(
+                snapshot.currentIndex.coerceIn(0, maxOf(0, snapshot.queue.lastIndex)),
+            )
+            .setContentPositionMs(snapshot.positionMs.coerceAtLeast(0L))
+            .setContentBufferedPositionMs(
+                PositionSupplier.getConstant(snapshot.bufferedPositionMs.coerceAtLeast(0L)),
+            )
+            .setRepeatMode(snapshot.repeatMode)
+            .setShuffleModeEnabled(snapshot.shuffleModeEnabled)
+            .setVolume(engine.volume)
+            .build()
     }
 
     // -----------------------------------------------------------------------
-    // Commands
+    // Transport
     // -----------------------------------------------------------------------
 
-    override fun handleSetPlayWhenReady(
-        playWhenReady: Boolean,
-        playerCommand: Int,
-    ): ListenableFuture<*> {
-        this.playWhenReady = playWhenReady
+    override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
         if (playWhenReady) engine.play() else engine.pause()
         return Futures.immediateVoidFuture()
     }
@@ -102,40 +94,14 @@ class NoizPlayer(
     }
 
     override fun handleStop(): ListenableFuture<*> {
-        playWhenReady = false
         engine.stop()
         return Futures.immediateVoidFuture()
     }
 
     override fun handleRelease(): ListenableFuture<*> {
-        if (!released) {
-            released = true
-            scope.cancel()
-            engine.release()
-        }
-        return Futures.immediateVoidFuture()
-    }
-
-    override fun handleSetMediaItems(
-        mediaItems: List<MediaItem>,
-        startIndex: Int,
-        startPositionMs: Long,
-    ): ListenableFuture<*> {
-        // MediaItems here already carry a `noiz://track/{id}/{rendition}` URI; the
-        // loudness/gapless extras are read back out so normalization and crossfade
-        // decisions survive the trip through the session.
-        val tracks = mediaItems.map { item ->
-            val extras = item.mediaMetadata.extras
-            EngineTrack(
-                mediaItem = item,
-                renditionId = item.uri.lastPathSegment ?: "orig",
-                loudnessLufs = extras?.getFloat(EXTRA_LUFS, Float.NaN)?.takeIf { it.isFinite() },
-                truePeakDb = extras?.getFloat(EXTRA_PEAK_DB, Float.NaN)?.takeIf { it.isFinite() },
-                gaplessNext = extras?.getBoolean(EXTRA_GAPLESS_NEXT) ?: false,
-                durationMs = extras?.getLong(EXTRA_DURATION_MS) ?: 0L,
-            )
-        }
-        engine.setQueue(tracks, startIndex, startPositionMs)
+        // Stop invalidating a released facade.
+        collectorJob.cancel()
+        engine.release()
         return Futures.immediateVoidFuture()
     }
 
@@ -144,60 +110,84 @@ class NoizPlayer(
         positionMs: Long,
         seekCommand: Int,
     ): ListenableFuture<*> {
-        when (seekCommand) {
-            Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
-            Player.COMMAND_SEEK_TO_PREVIOUS,
-            -> engine.seekToPrevious()
-
-            Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
-            Player.COMMAND_SEEK_TO_NEXT,
-            -> engine.seekToNext()
-
-            Player.COMMAND_SEEK_TO_MEDIA_ITEM -> engine.seekToIndex(mediaItemIndex)
-            else -> engine.seekTo(positionMs)
+        // Apply exactly one target. Doing both below meant a combined
+        // "seek to item N at T" ran transitionTo() and then seekTo(), and the second
+        // call re-aborted the transition the first had just started.
+        if (mediaItemIndex != C.INDEX_UNSET && mediaItemIndex != snapshot.currentIndex) {
+            engine.seekToIndex(mediaItemIndex, userSkip = false)
+        } else if (positionMs != C.TIME_UNSET) {
+            engine.seekTo(positionMs)
         }
         return Futures.immediateVoidFuture()
     }
 
     override fun handleSetRepeatMode(repeatMode: Int): ListenableFuture<*> {
-        this.repeatMode = repeatMode
         engine.setRepeatMode(repeatMode)
         return Futures.immediateVoidFuture()
     }
 
     override fun handleSetShuffleModeEnabled(shuffleModeEnabled: Boolean): ListenableFuture<*> {
-        this.shuffleModeEnabled = shuffleModeEnabled
         engine.setShuffleModeEnabled(shuffleModeEnabled)
         return Futures.immediateVoidFuture()
     }
 
     override fun handleSetVolume(volume: Float): ListenableFuture<*> {
-        this.volume = volume.coerceIn(0f, 1f)
-        engine.setVolume(this.volume)
+        engine.setVolume(volume)
         return Futures.immediateVoidFuture()
     }
 
-    override fun handleSetPlaybackParameters(
-        playbackParameters: PlaybackParameters,
+    override fun handleSetPlaybackParameters(playbackParameters: PlaybackParameters): ListenableFuture<*> {
+        // Variable speed is not part of the noiz playback model; acknowledge and ignore.
+        return Futures.immediateVoidFuture()
+    }
+
+    // -----------------------------------------------------------------------
+    // Playlist (canonical queue)
+    // -----------------------------------------------------------------------
+
+    /**
+ * Builds the canonical queue from externally supplied [MediaItem]s.
+ *
+ * Loudness, true peak, rendition and the gapless flag travel in
+ * `MediaItem.requestMetadata` so Android Auto, the Assistant and session restore all
+ * keep normalization and gapless semantics. Previously this rebuilt bare
+ * `EngineTrack`s, so anything set through a `MediaController` played un-normalized with
+ * crossfades applied across album-continuous tracks.
+ */
+override fun handleSetMediaItems(
+        mediaItems: List<MediaItem>,
+        startIndex: Int,
+        startPositionMs: Long,
     ): ListenableFuture<*> {
-        // Crossfade math assumes real-time playback; speed changes are forwarded but
-        // the ramp duration is scaled by the ratio in the engine.
-        this.playbackParameters = playbackParameters
-        engine.currentPlayer().playbackParameters = playbackParameters
+        engine.setQueue(
+            mediaItems.map { item -> item.toEngineTrack() },
+            startIndex,
+            startPositionMs.coerceAtLeast(0L),
+        )
         return Futures.immediateVoidFuture()
     }
 
-    /** Exposed to the service so the media notification can label the queue. */
-    fun engineQueue(): List<EngineTrack> = engine.snapshot.value.queue
+    private fun MediaItem.toEngineTrack(): EngineTrack {
+        val request = requestMetadata
+        return EngineTrack(
+            mediaItem = this,
+            renditionId = request?.getString(KEY_RENDITION) ?: EngineTrack.DEFAULT_RENDITION,
+            loudnessLufs = request?.getFloatOrNull(KEY_LOUDNESS_LUFS),
+            truePeakDb = request?.getFloatOrNull(KEY_TRUE_PEAK_DB),
+            gaplessNext = request?.getBoolean(KEY_GAPLESS_NEXT) ?: false,
+            durationMs = request?.getLong(KEY_DURATION_MS)
+                ?: if (localConfiguration != null) durationMs else 0L,
+        )
+    }
+
+    private fun Bundle.getFloatOrNull(key: String): Float? =
+        if (containsKey(key)) getFloat(key, Float.NaN).takeIf { !it.isNaN() } else null
 
     companion object {
-        const val EXTRA_LUFS = "noiz.loudness_lufs"
-        const val EXTRA_PEAK_DB = "noiz.true_peak_db"
-        const val EXTRA_GAPLESS_NEXT = "noiz.gapless_next"
-        const val EXTRA_DURATION_MS = "noiz.duration_ms"
-
-        private val ALL_COMMANDS: Player.Commands = Player.Commands.Builder()
-            .addAllCommands()
-            .build()
+        const val KEY_RENDITION = "noiz.rendition"
+        const val KEY_LOUDNESS_LUFS = "noiz.loudnessLufs"
+        const val KEY_TRUE_PEAK_DB = "noiz.truePeakDb"
+        const val KEY_GAPLESS_NEXT = "noiz.gaplessNext"
+        const val KEY_DURATION_MS = "noiz.durationMs"
     }
 }

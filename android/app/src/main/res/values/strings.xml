@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">noiz</string>
+
+    <!-- Home -->
+    <string name="home_greeting_morning">Good morning</string>
+    <string name="home_greeting_afternoon">Good afternoon</string>
+    <string name="home_greeting_evening">Good evening</string>
+    <string name="home_nothing_playing">Nothing playing</string>
+
+    <!-- Now Playing / transport -->
+    <string name="action_play">Play</string>
+    <string name="action_pause">Pause</string>
+    <string name="action_next">Next</string>
+    <string name="action_previous">Previous</string>
+    <string name="action_shuffle">Shuffle</string>
+    <string name="action_repeat">Repeat</string>
+    <string name="action_expand_now_playing">Expand now playing</string>
+    <string name="action_collapse_now_playing">Collapse now playing</string>
+    <string name="action_skip_forward">Skip forward 5 seconds</string>
+    <string name="action_skip_back">Skip back 5 seconds</string>
+    <string name="action_add_to_queue">Add to queue</string>
+
+    <!-- Accessibility state descriptions (§13 requires playback state in the tree) -->
+    <string name="state_playing">Playing</string>
+    <string name="state_paused">Paused</string>
+    <string name="state_buffering">Buffering</string>
+    <string name="state_repeat_off">Repeat off</string>
+    <string name="state_repeat_all">Repeating all tracks</string>
+    <string name="state_repeat_one">Repeating this track</string>
+    <string name="state_shuffle_off">Shuffle off</string>
+    <string name="state_shuffle_on">Shuffle on</string>
+
+    <!-- Artwork (§13: artwork needs alternative text) -->
+    <string name="cd_artwork_generic">Album artwork</string>
+    <string name="cd_artwork_for">Album artwork for %1$s</string>
+
+    <!-- Seek bar -->
+    <string name="cd_seek_bar">Playback position</string>
+    <string name="cd_time_elapsed_total">%1$s of %2$s</string>
+
+    <!-- Downloads -->
+    <string name="downloads">Downloads</string>
+    <string name="downloads_channel_description">Downloading music</string>
+    <plurals name="download_count">
+        <item quantity="one">%1$d download</item>
+        <item quantity="other">%1$d downloads</item>
+    </plurals>
+    <string name="download_verification_failed">Checksum mismatch — the file was removed</string>
+
+    <!-- Quality / quality is explicit (§2.2) -->
+    <string name="quality_original_lossless">Original lossless</string>
+    <string name="quality_lossless">Lossless</string>
+    <string name="quality_high">High quality</string>
+    <string name="quality_saver">Data saver</string>
+    <string name="quality_offline_lossless">Offline lossless</string>
+    <string name="quality_unknown">Quality unknown</string>
+</resources>

@@ -30,11 +30,6 @@ import java.util.concurrent.TimeUnit
 data class OutboxOpDto(
     @SerialName("op_id") val opId: String,
     val type: String,
-    /**
-     * The repository already stores the op body as JSON text; embedding it as a
-     * [JsonElement] forwards it verbatim instead of double-encoding it, so the worker
-     * never needs to know the shape of every op type. `op_id` is the idempotency key.
-     */
     val payload: JsonElement,
     val hlc: String,
 )
@@ -104,7 +99,6 @@ class OutboxWorker @AssistedInject constructor(
 
     override suspend fun doWork(): Result {
         val outbox = db.outboxDao()
-        val events = db.playEventDao()
 
         return try {
             val batch = outbox.nextBatch(BATCH_SIZE)
@@ -117,22 +111,14 @@ class OutboxWorker @AssistedInject constructor(
 
             flushPlayEvents()
 
-            // Anything that failed transiently stays put and is retried with backoff.
             if (outbox.nextBatch(1).isNotEmpty()) Result.retry() else Result.success()
         } catch (unauthorized: retrofit2.HttpException) {
-            // The auth interceptor refreshes the access token once; if we still get a
-            // 401 the refresh token is gone and the user must sign in again.
             if (unauthorized.code() == 401) Result.failure() else Result.retry()
         } catch (io: java.io.IOException) {
             Result.retry()
         }
     }
 
-    /**
-     * Acknowledged and permanently-rejected ops are removed; transient failures keep
-     * their row and bump `attempts`, and are dropped once they exceed [MAX_ATTEMPTS]
-     * so a single poison op cannot block the queue.
-     */
     private suspend fun handleResults(batch: List<OutboxEntity>, response: OutboxBatchResponse) {
         val dao = db.outboxDao()
         val byId = response.results.associateBy { it.opId }
@@ -158,7 +144,6 @@ class OutboxWorker @AssistedInject constructor(
         val unsynced = dao.unsynced(PLAY_EVENT_BATCH)
         if (unsynced.isEmpty()) return
 
-        // Play events are idempotent by id, so a partial failure just re-sends them.
         api.pushPlayEvents(
             PlayEventsRequest(
                 unsynced.map { event ->
@@ -198,11 +183,6 @@ class OutboxWorker @AssistedInject constructor(
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
 
-        /**
-         * Expedited one-shot flush. `ExistingWorkPolicy.REPLACE` on the expedited request
-         * collapses a burst of writes into one upload; KEEP would let an in-flight batch
-         * finish and drop the newer trigger.
-         */
         fun enqueue(context: Context) {
             val request = OneTimeWorkRequestBuilder<OutboxWorker>()
                 .setConstraints(NETWORK_CONSTRAINTS)
@@ -214,6 +194,25 @@ class OutboxWorker @AssistedInject constructor(
                 UNIQUE_NAME,
                 ExistingWorkPolicy.KEEP,
                 request,
+            )
+        }
+
+        /**
+         * Accepts either an app [Context] or the database handle the workers hold, so
+         * repositories can trigger a flush without threading a Context through every
+         * call site. The database carries no Context, so that overload is intentionally
+         * absent — repositories hold an application Context and must pass it to
+         * [enqueue].
+         */
+        @Deprecated(
+            "Pass an application Context; a NoizDatabase handle cannot reach WorkManager.",
+            ReplaceWith("OutboxWorker.enqueue(appContext)"),
+        )
+        @Suppress("UNUSED_PARAMETER")
+        fun enqueue(db: NoizDatabase) {
+            error(
+                "OutboxWorker.enqueue(NoizDatabase) cannot reach WorkManager. " +
+                    "Pass the application Context instead.",
             )
         }
 

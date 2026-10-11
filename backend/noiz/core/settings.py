@@ -5,8 +5,12 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# `alg` is env-configurable, so it needs an allowlist: an operator setting
+# NOIZ_JWT_ALGORITHM=none would otherwise disable signature verification entirely.
+ALLOWED_JWT_ALGORITHMS = frozenset({"HS256", "HS384", "HS512"})
 
 
 class Settings(BaseSettings):
@@ -83,6 +87,34 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _reject_placeholder_secrets(self) -> "Settings":
+        """Fail at boot rather than run with a publicly-known signing key.
+
+        `.env.example` ships `change-me` / `change-me-too`, and docker-compose only
+        checks that the variables are *non-empty*, so a verbatim `cp .env.example .env`
+        produced a working deployment that anyone could forge stream signatures for.
+        """
+        if self.environment != "production":
+            return self
+
+        weak = {"change-me-in-.env", "change-me-too", "change-me", "", "secret", "noiz"}
+        for name in ("jwt_secret", "stream_hmac_secret"):
+            value = getattr(self, name)
+            if value.strip().lower() in weak or len(value) < 32:
+                raise ValueError(
+                    f"{name} is a placeholder or too short ({len(value)} chars). "
+                    f"Generate one with: openssl rand -hex 32"
+                )
+
+        if self.jwt_algorithm not in ALLOWED_JWT_ALGORITHMS:
+            raise ValueError(
+                f"jwt_algorithm must be one of {sorted(ALLOWED_JWT_ALGORITHMS)}, "
+                f"got {self.jwt_algorithm!r}"
+            )
+
+        return self
 
 
 @lru_cache(maxsize=1)

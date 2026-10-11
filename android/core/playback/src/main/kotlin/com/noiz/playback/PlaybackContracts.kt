@@ -1,5 +1,7 @@
 package com.noiz.playback
 
+import android.content.Context
+import android.os.Bundle
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.session.SessionCommand
@@ -10,6 +12,44 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+
+/**
+ * Process-wide service locator for playback collaborators.
+ *
+ * `PlaybackService` is instantiated by the Android framework and cannot receive
+ * constructor injection, so `:app` installs its collaborators here from
+ * `NoizApplication.onCreate` (via `AppGraph.install`) before the service binds.
+ *
+ * Every slot defaults to a factory that throws with an actionable message, so a
+ * missing installation fails loudly at bind time instead of silently degrading to a
+ * bare ExoPlayer.
+ */
+object PlaybackComponents {
+
+    /** `(context, scope) -> engine`. The scope is the service's main-thread scope. */
+    @Volatile
+    var engineFactory: (Context, CoroutineScope) -> DualPlayerEngine = { _, _ ->
+        notInstalled("engineFactory")
+    }
+
+    @Volatile
+    var restoreStoreFactory: (Context) -> QueueRestoreStore = { notInstalled("restoreStoreFactory") }
+
+    @Volatile
+    var browseTreeFactory: (Context) -> BrowseTreeProvider = { notInstalled("browseTreeFactory") }
+
+    @Volatile
+    var favoritesFactory: (Context) -> FavoritesWriter = { notInstalled("favoritesFactory") }
+
+    @Volatile
+    var settingsFactory: (Context) -> PlaybackSettings = { notInstalled("settingsFactory") }
+
+    private fun notInstalled(name: String): Nothing = error(
+        "PlaybackComponents.$name was never installed. " +
+            "Call AppGraph.install(this) from NoizApplication.onCreate before the " +
+            "MediaSessionService binds.",
+    )
+}
 
 /** Custom session commands (§3.5). */
 object NoizCommands {
@@ -22,7 +62,7 @@ object NoizCommands {
 
     const val ARG_MEDIA_ID = "media_id"
 
-    private fun cmd(action: String) = SessionCommand(action, SessionCommand.COMMAND_VERSION)
+    private fun cmd(action: String) = SessionCommand(action, Bundle.EMPTY)
 
     /** Available everywhere, including Android Auto (max four custom actions there). */
     val all: Set<SessionCommand> = setOf(

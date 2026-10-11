@@ -18,8 +18,12 @@ import hashlib
 import mimetypes
 import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Final
+from urllib.parse import quote
+
+import anyio
 
 import asyncpg
 from fastapi import APIRouter, Header, HTTPException, Path as PathParam, Query, Response, status
@@ -27,7 +31,9 @@ from fastapi.responses import StreamingResponse
 
 from noiz.api.deps import DbConn, PrincipalDep, SettingsDep
 from noiz.core import security
+from noiz.core.db import short_lived_conn as _released_connection
 from noiz.core.settings import Settings
+from uuid import UUID
 
 # Metadata routes are mounted under /api/v1; byte-serving routes are mounted at the
 # root so a signed URL handed to nginx needs no rewrite hop (§9.2).
@@ -92,12 +98,17 @@ def parse_range_header(header: str, size: int) -> tuple[int, int] | None:
 
 
 async def _iter_file_range(path: Path, start: int, end: int, chunk_bytes: int) -> AsyncIterator[bytes]:
-    """Reads `[start, end]` inclusive without loading the file into memory."""
+    """Reads `[start, end]` inclusive without loading the file into memory.
+
+    The read runs in a worker thread: a synchronous `read()` on the event loop would
+    stall every other request — health checks included — for the whole transfer.
+    """
     remaining = end - start + 1
-    with path.open("rb") as handle:
-        handle.seek(start)
+    with await anyio.to_thread.run_sync(lambda: path.open("rb")) as handle:
+        await anyio.to_thread.run_sync(handle.seek, start)
         while remaining > 0:
-            chunk = handle.read(min(chunk_bytes, remaining))
+            want = min(chunk_bytes, remaining)
+            chunk = await anyio.to_thread.run_sync(handle.read, want)
             if not chunk:
                 break
             remaining -= len(chunk)
@@ -122,10 +133,10 @@ def _etag(sha256_hex: str) -> str:
 
 @router.get("/tracks/{track_id}/stream-manifest")
 async def stream_manifest(
-    track_id: str,
     conn: DbConn,
     settings: SettingsDep,
     principal: PrincipalDep,
+    track_id: Annotated[UUID, PathParam()],
 ) -> dict:
     """Renditions, loudness metadata and freshly signed URLs for one track."""
     track = await conn.fetchrow(
@@ -184,7 +195,7 @@ async def stream_manifest(
                 "sha256": rendition["sha256"].hex() if isinstance(rendition["sha256"], bytes) else rendition["sha256"],
                 "url": (
                     f"/stream/{track_id}/{rendition['id']}"
-                    f"?exp={expires_at}&sig={signature}"
+                    f"?exp={expires_at}&sig={signature}&user={quote(principal.user_id, safe='')}"
                 ),
             },
         )
@@ -211,7 +222,7 @@ async def stream_manifest(
 async def _lookup_rendition(
     conn: asyncpg.Connection,
     settings: Settings,
-    track_id: str,
+    track_id: UUID,
     rendition_id: str,
 ) -> dict[str, Any]:
     row = await conn.fetchrow(
@@ -246,32 +257,39 @@ async def _lookup_rendition(
 
 @media_router.get("/stream/{track_id}/{rendition_id}")
 async def stream_media(
-    conn: DbConn,
     settings: SettingsDep,
-    track_id: Annotated[str, PathParam()],
+    track_id: Annotated[UUID, PathParam()],
     rendition_id: Annotated[str, PathParam(pattern="^(orig|flac16|opus256|opus128|opus64)$")],
     exp: Annotated[int, Query()],
     sig: Annotated[str, Query()],
     user: Annotated[str, Query(description="User id bound into the signature")],
     range_header: Annotated[str | None, Header(alias="Range")] = None,
     if_none_match: Annotated[str | None, Header(alias="If-None-Match")] = None,
+    if_range: Annotated[str | None, Header(alias="If-Range")] = None,
 ) -> Response:
     """Signed, range-addressable media bytes.
 
-    The signature binds `user|track|rendition|exp`, so a URL cannot be replayed for a
-    different user, track or rendition, and it expires 6 h after minting.
+    The signature binds `user`, `track`, `rendition` and `exp`, so a URL cannot be
+    replayed for a different user, track or rendition, and it expires shortly after
+    minting.
     """
     if not security.verify_stream_signature(
         settings,
         user_id=user,
-        track_id=track_id,
+        track_id=str(track_id),
         rendition=rendition_id,
         exp=exp,
         signature=sig,
     ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid or expired signature")
 
-    rendition = await _lookup_rendition(conn, settings, track_id, rendition_id)
+    # The database row is read inside a short-lived scope so the pooled connection is
+    # returned before the body streams. Holding it for the whole transfer exhausted the
+    # pool after 10 concurrent ranges and blocked every other API request for up to an
+    # hour (§12.3 availability).
+    async with _released_connection() as conn:
+        rendition = await _lookup_rendition(conn, settings, track_id, rendition_id)
+
     size: int = rendition["size_bytes"]
     sha256_hex = (
         rendition["sha256"].hex() if isinstance(rendition["sha256"], bytes) else str(rendition["sha256"])
@@ -279,12 +297,21 @@ async def stream_media(
     etag = _etag(sha256_hex)
     content_type = _content_type_for(rendition["codec"], rendition["resolved_path"])
 
+    # If-Range (§6.2): when the client's validator no longer matches, the cached copy it
+    # holds is stale, so the Range must be ignored and the whole entity resent.
+    effective_range = range_header
+    if if_range is not None and if_range != etag:
+        effective_range = None
+
     # Immutable rendition: a matching ETag means nothing changed, and Range is pointless.
-    if if_none_match == etag and range_header is None:
-        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+    if if_none_match == etag and effective_range is None:
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={"ETag": etag, "Cache-Control": settings.media_cache_control},
+        )
 
     try:
-        byte_range = parse_range_header(range_header, size) if range_header else None
+        byte_range = parse_range_header(effective_range, size) if effective_range else None
     except RangeNotSatisfiable:
         return Response(
             status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
@@ -311,13 +338,12 @@ async def stream_media(
     )
 
     if settings.x_accel_enabled:
-        # nginx reads the file itself; Content-Length/Range are computed by nginx.
+        # nginx serves the file itself and recomputes Content-Length/Range, so sending
+        # our own Content-Range here would conflict with what it produces.
         headers = {
             **common_headers,
             "X-Accel-Redirect": f"{settings.x_accel_internal_prefix}/{rendition['path']}",
         }
-        if byte_range is not None:
-            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         return Response(status_code=status_code, headers=headers)
 
     headers = {**common_headers, "Content-Length": str(end - start + 1)}
@@ -373,6 +399,9 @@ ALLOWED_ARTWORK_WIDTHS: Final = {128, 512, 1400}
 @media_router.get("/artwork/{artwork_hash}")
 async def artwork(
     settings: SettingsDep,
+    # Required: album art is a private catalog. Leaving this unauthenticated let anyone
+    # enumerate and download the whole library's covers from their content hashes.
+    _principal: PrincipalDep,
     artwork_hash: Annotated[str, PathParam(pattern="^[0-9a-f]{64}$")],
     width: Annotated[int, Query(alias="w")] = 512,
     fmt: Annotated[str, Query(pattern="^(webp|png|jpg)$")] = "webp",
@@ -390,9 +419,13 @@ async def artwork(
         "ETag": _etag(artwork_hash),
         "Accept-Ranges": "bytes",
         "Content-Type": f"image/{fmt}",
+        "X-Content-Type-Options": "nosniff",
     }
     if settings.x_accel_enabled:
         headers["X-Accel-Redirect"] = f"{settings.x_accel_internal_prefix}/{relative.as_posix()}"
         return Response(status_code=status.HTTP_200_OK, headers=headers)
 
-    return Response(content=resolved.read_bytes(), headers=headers)
+    # Read in a worker thread and stream, rather than blocking the event loop on a
+    # whole-file `read_bytes()`.
+    body = await anyio.to_thread.run_sync(resolved.read_bytes)
+    return Response(content=body, headers=headers)

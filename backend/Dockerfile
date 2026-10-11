@@ -21,18 +21,27 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY noiz ./noiz
-COPY alembic.ini ./alembic.ini
-COPY migrations ./migrations
+# `alembic.ini` / `migrations/` are not in the tree yet, and `COPY` of a missing path
+# is a hard build failure. Uncomment both lines once the baseline migration lands.
+# COPY alembic.ini ./alembic.ini
+# COPY migrations ./migrations
 
 # Ingest runs as an unprivileged user with no write access outside the job dir (§12).
+# /media and /inbox must be chowned too: Docker initialises named volumes from the
+# image directory, so `media:/media` and `inbox:/inbox` otherwise inherit root:root
+# 0755 and every ffmpeg/ingest write fails with EACCES.
 RUN useradd --system --uid 10001 --create-home noiz \
     && mkdir -p /media /inbox \
-    && chown -R noiz:noiz /srv/noiz
+    && chown -R noiz:noiz /srv/noiz /media /inbox \
+    && chmod 0750 /media /inbox
 USER noiz
 
 EXPOSE 8000
 
+# Probes /readyz rather than /healthz: /healthz never touches the database, so it
+# reports healthy while Postgres is down.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).status==200 else 1)"
 
-CMD ["uvicorn", "noiz.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# --proxy-headers so nginx's X-Forwarded-For is honoured for client IPs.
+CMD ["uvicorn", "noiz.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]

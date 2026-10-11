@@ -12,6 +12,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
+import re
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any, Final
@@ -27,6 +30,12 @@ _password_hasher: Final = PasswordHasher(time_cost=3, memory_cost=64 * 1024, par
 
 ACCESS_TOKEN_TYPE: Final = "access"
 REFRESH_TOKEN_TYPE: Final = "refresh"
+
+# base64url(HMAC-SHA256) is always 43 characters.
+_B64URL_SIG: Final = re.compile(r"^[A-Za-z0-9_-]{43}$")
+
+# §12.5: tolerate a small amount of device clock skew on signed URLs.
+CLOCK_SKEW_TOLERANCE_SECONDS: Final = 30
 
 
 class AuthError(Exception):
@@ -87,10 +96,10 @@ def create_access_token(settings: Settings, principal: Principal) -> tuple[str, 
         "typ": ACCESS_TOKEN_TYPE,
         "iat": now,
         "exp": now + expires_in,
-        # `jti` gives the refresh flow something to correlate against.
-        "jti": base64.urlsafe_b64encode(hashlib.sha256(f"{principal.user_id}{now}".encode()).digest())
-        .decode()
-        .rstrip("="),
+        # `jti` gives the refresh/revocation flow something to correlate against.
+        # Must be random: deriving it from (user_id, second) gives two tokens minted in
+        # the same second the same id, which defeats per-token revocation entirely.
+        "jti": secrets.token_urlsafe(16),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm), expires_in
 
@@ -103,6 +112,10 @@ def create_refresh_token(settings: Settings, user_id: str, device_id: str) -> st
         "typ": REFRESH_TOKEN_TYPE,
         "iat": now,
         "exp": now + settings.refresh_token_ttl_seconds,
+        # Without a random claim, every refresh for the same user+device inside the
+        # same second encodes to a byte-identical token — so "rotation" reissued the
+        # old value and reuse detection could never fire.
+        "jti": secrets.token_urlsafe(16),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
@@ -158,7 +171,14 @@ def sign_stream_url(
     """
     issued = now if now is not None else int(time.time())
     exp = issued + (ttl_seconds if ttl_seconds is not None else settings.stream_url_ttl_seconds)
-    message = f"{user_id}|{track_id}|{rendition}|{exp}".encode()
+    # JSON array rather than "a|b|c|d": `user_id` is client-supplied and `track_id` is an
+    # unconstrained path segment, so a delimiter-joined message is ambiguous — (user="a|b",
+    # track="c") and (user="a", track="b|c") produce the same signature.
+    message = json.dumps(
+        [user_id, track_id, rendition, exp],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
     signature = _b64url(
         hmac.new(settings.stream_hmac_secret.encode(), message, hashlib.sha256).digest(),
     )
@@ -177,7 +197,9 @@ def verify_stream_signature(
 ) -> bool:
     """Constant-time check used by both nginx's auth_request probe and the dev path."""
     current = now if now is not None else int(time.time())
-    if exp < current:
+    # Clock-skew tolerance (§12.5): a device a few seconds fast must not be denied a
+    # token it legitimately holds.
+    if exp < current - CLOCK_SKEW_TOLERANCE_SECONDS:
         return False
 
     expected, _ = sign_stream_url(
@@ -188,7 +210,12 @@ def verify_stream_signature(
         ttl_seconds=0,
         now=exp,
     )
-    return hmac.compare_digest(expected, signature)
+    # compare_digest rejects non-ASCII str operands with TypeError, so an attacker could
+    # turn any stream request into an unauthenticated 500 by putting a non-ASCII byte in
+    # `sig`. Compare bytes instead, and reject an implausible length up front.
+    if not _B64URL_SIG.fullmatch(signature):
+        return False
+    return hmac.compare_digest(expected.encode("utf-8"), signature.encode("utf-8"))
 
 
 def behaviour_token(settings: Settings, *, endpoint: str, now: int | None = None) -> str:

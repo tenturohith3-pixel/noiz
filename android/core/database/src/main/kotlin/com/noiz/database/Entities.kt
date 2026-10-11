@@ -1,6 +1,5 @@
 package com.noiz.database
 
-import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Fts4
 import androidx.room.FtsOptions
@@ -135,7 +134,7 @@ data class DownloadEntity(
  *
  * `opId` is the idempotency key the server dedupes on.
  */
-@Entity(tableName = "outbox", indices = [Index("createdAt"), Index("attempts")])
+@Entity(tableName = "outbox", indices = [Index("hlc"), Index("createdAt"), Index("attempts")])
 data class OutboxEntity(
     @PrimaryKey val opId: String,
     val type: String,
@@ -204,9 +203,6 @@ data class PaletteCacheEntity(
 )
 @Entity(tableName = "search_index")
 data class SearchIndexEntity(
-    @PrimaryKey
-    @ColumnInfo(name = "rowid")
-    val rowId: Long = 0,
     val entityType: String,
     val entityId: String,
     val title: String,

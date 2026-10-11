@@ -27,11 +27,13 @@ include(":app")
 
 // --- core (feature:* may depend on core:* only; core:playback never depends on
 //     feature:* — PRD §3.2) -------------------------------------------------
+include(":core:common")
 include(":core:designsystem")
 include(":core:model")
 include(":core:network")
 include(":core:database")
 include(":core:data")
+include(":core:datastore")
 include(":core:playback")
 include(":core:download")
 

@@ -16,6 +16,10 @@ import os
 
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import worker_process_init
+
+from noiz.core.db import close_pool, init_pool
+from noiz.core.settings import get_settings
 
 # Dedicated queues so a 500k-track analysis backlog can never delay a user upload.
 TASK_QUEUES = ("ingest", "transcode", "analysis", "enrich", "scrobble")
@@ -53,14 +57,48 @@ TASK_MODULES = (
 
 
 def _installed_task_modules() -> list[str]:
-    return [name for name in TASK_MODULES if importlib.util.find_spec(name) is not None]
+    """Task modules that actually exist, without raising for the ones that don't.
+
+    `importlib.util.find_spec("noiz.ingest.tasks")` imports the *parent* package, so it
+    raises `ModuleNotFoundError` rather than returning `None` when `noiz.ingest` is
+    absent. That propagated out of `create_celery()` and killed the worker at startup,
+    which is the opposite of what the comment above claims.
+    """
+    found: list[str] = []
+    for name in TASK_MODULES:
+        try:
+            if importlib.util.find_spec(name) is not None:
+                found.append(name)
+        except (ImportError, ModuleNotFoundError, ValueError):
+            continue
+    return found
+
+
+def _resolved_rate_limits() -> dict:
+    """Expand the RATE_LIMITS globs onto the tasks that are actually registered.
+
+    Celery matches `task_annotations` by exact task name. Globbing is only supported by
+    `task_routes`, so the previous glob dict was inert and every provider request went
+    out unthrottled — the opposite of the "rate limits are respected" claim.
+    """
+    from celery.app.registry import tasks as _registry
+
+    resolved: dict = {}
+    for pattern, limit in RATE_LIMITS.items():
+        prefix = pattern.rstrip("*")
+        for name in _registry:
+            if name == pattern or name.startswith(prefix):
+                resolved[name] = {"rate_limit": limit}
+    return resolved
 
 
 def create_celery() -> Celery:
+    settings = get_settings()
+
     app = Celery(
         "noiz",
-        broker=os.environ.get("NOIZ_REDIS_URL", "redis://redis:6379/0"),
-        backend=os.environ.get("NOIZ_REDIS_URL", "redis://redis:6379/0"),
+        broker=settings.redis_url,
+        backend=settings.redis_url,
         include=_installed_task_modules(),
     )
 
@@ -68,7 +106,10 @@ def create_celery() -> Celery:
         task_default_queue=TASK_DEFAULT_QUEUE,
         task_queues={queue: {"exchange": queue, "routing_key": queue} for queue in TASK_QUEUES},
         task_routes=TASK_ROUTES,
-        task_annotations=RATE_LIMITS,
+        # `task_annotations` is keyed by EXACT task name — glob patterns are a
+        # `task_routes` feature only. Passing the globs silently applied nothing, so
+        # every provider call ran unthrottled.
+        task_annotations=_resolved_rate_limits(),
         # Long media jobs: 10 minute wall-clock cap matches the ingest sandbox limit (§12).
         task_time_limit=600,
         task_soft_time_limit=540,
@@ -112,3 +153,15 @@ def create_celery() -> Celery:
 
 
 celery_app = create_celery()
+
+
+@worker_process_init.connect
+def _bootstrap_pool(**_: object) -> None:
+    """Every prefork child needs its own asyncpg pool.
+
+    Without this, any task touching the database hit
+    `RuntimeError("database pool is not initialised")`.
+    """
+    import anyio
+
+    anyio.run(lambda: init_pool(get_settings()))
