@@ -31,6 +31,7 @@ import com.noiz.model.Track
 import com.noiz.network.NoizApi
 import com.noiz.network.SearchResultDto
 import dagger.assisted.Assisted
+import dagger.assisted.AssistedInject
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -398,7 +399,7 @@ data class SyncPage(val nextCursor: String?, val hasMore: Boolean)
 
 /** Background pull; kept separate so the repository stays free of WorkManager types. */
 @androidx.hilt.work.HiltWorker
-class CatalogSyncWorker @javax.inject.Inject constructor(
+class CatalogSyncWorker @AssistedInject constructor(
     @Assisted appContext: Context,
     @Assisted params: WorkerParameters,
     private val repository: CatalogRepository,

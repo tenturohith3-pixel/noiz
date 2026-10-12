@@ -52,7 +52,9 @@ class DownloadsRepository @Inject constructor(
         pinnedBy: String? = null,
     ): Boolean {
         val track = db.trackDao().byId(trackId) ?: return false
-        val renditions = db.renditionDao().forTrack(trackId).map { entity ->
+        // `forTrack` is a Flow; collect the (small, bounded) rendition list once.
+        val entities = db.renditionDao().forTrack(trackId).first()
+        val renditions = entities.map { entity ->
             com.noiz.model.Rendition(
                 id = entity.id,
                 codec = entity.codec,

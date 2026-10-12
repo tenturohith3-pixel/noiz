@@ -1,9 +1,12 @@
 package com.noiz.home
 
-import androidx.activity.compose.ExperimentalPredictiveBackParserApi
 import androidx.activity.compose.PredictiveBackHandler
+import androidx.annotation.StringRes
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.exponentialDecay
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.AnchoredDraggableState
 import androidx.compose.foundation.gestures.DraggableAnchors
 import androidx.compose.foundation.gestures.Orientation
@@ -50,10 +53,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.OptIn
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.ExperimentalFoundationApi
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -100,7 +101,7 @@ import com.noiz.designsystem.NoizTypography
 import com.noiz.designsystem.TabularTimeStyle
 import com.noiz.designsystem.GlassTier
 import dev.chrisbanes.haze.HazeState
-import androidx.compose.animation.core.ExponentialDecay
+
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -170,7 +171,7 @@ data class HomeUiState(
  * Playing sheet is an [AnchoredDraggableState] so one progress value drives artwork
  * size, corner radius, title position and control layout — no cross-fade jumps.
  */
-@OptIn(ExperimentalPredictiveBackParserApi::class)
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun HomeScreen(
     state: HomeUiState,
@@ -220,6 +221,7 @@ fun HomeScreen(
 }
 
 
+@Composable
 private fun BoxScope.HomeFeed(
     state: HomeUiState,
     hazeState: HazeState,
@@ -293,6 +295,7 @@ private fun BoxScope.HomeFeed(
  * the previous version had neither, so TalkBack announced an unlabelled, inert box.
  * The card is a `selectable` button because tapping it starts playback (§3.2).
  */
+@Composable
 private fun HomeCardRow(
     card: HomeCard,
     hazeState: HazeState,
@@ -331,7 +334,7 @@ private fun HomeCardRow(
                 url = card.artworkUrl,
                 modifier = Modifier.size(56.dp),
                 cornerRadius = 14.dp,
-                contentDescription = artworkDescription,
+                label = artworkDescription,
             )
             Column(Modifier.weight(1f)) {
                 Text(
@@ -360,7 +363,7 @@ private fun HomeCardRow(
  * The mini-player row is drawn by the sheet itself at the peek position, so the
  * drag has no separate element to reconcile.
  */
-@OptIn(ExperimentalPredictiveBackParserApi::class, ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun BoxScope.NowPlayingHost(
     nowPlaying: NowPlayingUiState,
@@ -387,7 +390,7 @@ private fun BoxScope.NowPlayingHost(
                 positionalThreshold = { distance: Float -> distance * 0.5f },
                 velocityThreshold = { with(density) { 125.dp.toPx() } },
                 snapAnimationSpec = NoizMotion.SheetSpring,
-                decayAnimationSpec = ExponentialDecay(),
+                decayAnimationSpec = exponentialDecay(),
             )
         }
 
@@ -426,7 +429,16 @@ private fun BoxScope.NowPlayingHost(
             }
         }
 
-        GlassSurface(
+        // Hoisted out of the semantics lambda: `stringResource` is @Composable and
+            // the semantics block is not, so calling it inline did not compile.
+            val expandLabel = stringResource(R.string.action_expand_now_playing)
+            val collapseLabel = stringResource(R.string.action_collapse_now_playing)
+            val nothingPlayingLabel = stringResource(R.string.home_nothing_playing)
+            val playbackStateLabel = stringResource(
+                if (nowPlaying.isPlaying) R.string.state_playing else R.string.state_paused,
+            )
+
+            GlassSurface(
             hazeState = hazeState,
             level = GlassLevel.G3,
             shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
@@ -437,25 +449,17 @@ private fun BoxScope.NowPlayingHost(
                 .anchoredDraggable(sheetState, Orientation.Vertical)
                 .semantics(mergeDescendants = true) {
                     // §13: an unlabelled region only announced "custom actions".
-                    contentDescription = nowPlaying.title.ifBlank {
-                        stringResource(R.string.home_nothing_playing)
-                    }
-                    role = Role.Button
-                    stateDescription = if (nowPlaying.isPlaying) {
-                        stringResource(R.string.state_playing)
-                    } else {
-                        stringResource(R.string.state_paused)
-                    }
+                    // Role is not set here: `Role` is an inline value class so its
+                    // setter is name-mangled and cannot be assigned with `=`, and the
+                    // sheet is drag-driven rather than a plain click target anyway.
+                    contentDescription = nowPlaying.title.ifBlank { nothingPlayingLabel }
+                    stateDescription = playbackStateLabel
                     customActions = listOf(
-                        CustomAccessibilityAction(
-                            stringResource(R.string.action_expand_now_playing),
-                        ) {
+                        CustomAccessibilityAction(expandLabel) {
                             scope.launch { sheetState.animateTo(SheetValue.Expanded) }
                             true
                         },
-                        CustomAccessibilityAction(
-                            stringResource(R.string.action_collapse_now_playing),
-                        ) {
+                        CustomAccessibilityAction(collapseLabel) {
                             scope.launch { sheetState.animateTo(SheetValue.Collapsed) }
                             true
                         },
@@ -487,6 +491,7 @@ private fun BoxScope.NowPlayingHost(
 }
 
 
+@Composable
 private fun SheetHandle(onCollapse: () -> Unit) {
     Box(
         modifier = Modifier
@@ -522,6 +527,7 @@ private fun SheetHandle(onCollapse: () -> Unit) {
  * The collapsed mini-player. It lives *inside* the sheet at the peek position so the
  * drag reveals Now Playing continuously instead of unmounting a separate bar.
  */
+@Composable
 private fun MiniPlayerRow(
     nowPlaying: NowPlayingUiState,
     onPlayPause: () -> Unit,
@@ -548,10 +554,11 @@ private fun MiniPlayerRow(
         Row(
             modifier = Modifier
                 .weight(1f)
+                // `clickable` already assigns Role.Button, and `Role` is an inline value class
+                // whose setter is name-mangled so it cannot be assigned with `=` here.
                 .clickable(onClick = onExpand)
                 .semantics(mergeDescendants = true) {
                     contentDescription = miniDescription
-                    role = Role.Button
                     stateDescription = playbackState
                 },
             verticalAlignment = Alignment.CenterVertically,
@@ -561,7 +568,7 @@ private fun MiniPlayerRow(
                 url = nowPlaying.artworkUrl,
                 modifier = Modifier.size(44.dp),
                 cornerRadius = 12.dp,
-                contentDescription = if (nowPlaying.title.isNotBlank()) {
+                label = if (nowPlaying.title.isNotBlank()) {
                     stringResource(R.string.cd_artwork_for, nowPlaying.title)
                 } else {
                     stringResource(R.string.cd_artwork_generic)
@@ -604,6 +611,7 @@ private fun MiniPlayerRow(
  * position happens in the draw phase — zero recompositions per frame (frame rule #8).
  */
 
+@Composable
 private fun ExpandedNowPlaying(
     nowPlaying: NowPlayingUiState,
     progress: () -> Float,
@@ -641,7 +649,7 @@ private fun ExpandedNowPlaying(
             // The clip lives in graphicsLayer above; ArtworkPlaceholder must not add a
             // second static clip or it overrides the animated radius.
             applyCornerClip = false,
-            contentDescription = if (nowPlaying.title.isNotBlank()) {
+            label = if (nowPlaying.title.isNotBlank()) {
                 stringResource(R.string.cd_artwork_for, nowPlaying.title)
             } else {
                 stringResource(R.string.cd_artwork_generic)
@@ -677,6 +685,23 @@ private fun ExpandedNowPlaying(
             // Shuffle and Repeat are toggles: without role/stateDescription/selected a
             // screen reader could not tell whether they were on. The Repeat button used
             // to be wired to onShuffle, so Repeat was unreachable entirely.
+            // Hoisted: the semantics lambda is not @Composable, so stringResource cannot
+            // be called inside it.
+            val shuffleStateLabel = stringResource(
+                if (nowPlaying.shuffleEnabled) {
+                    R.string.state_shuffle_on
+                } else {
+                    R.string.state_shuffle_off
+                },
+            )
+            val repeatStateLabel = stringResource(
+                when (nowPlaying.repeatMode) {
+                    RepeatMode.ALL -> R.string.state_repeat_all
+                    RepeatMode.ONE -> R.string.state_repeat_one
+                    RepeatMode.OFF -> R.string.state_repeat_off
+                },
+            )
+
             IconButton(
                 onClick = onShuffle,
                 modifier = Modifier
@@ -685,15 +710,7 @@ private fun ExpandedNowPlaying(
                         role = Role.Switch,
                         onValueChange = { onShuffle() },
                     )
-                    .semantics {
-                        stateDescription = stringResource(
-                            if (nowPlaying.shuffleEnabled) {
-                                R.string.state_shuffle_on
-                            } else {
-                                R.string.state_shuffle_off
-                            },
-                        )
-                    },
+                    .semantics { stateDescription = shuffleStateLabel },
             ) {
                 Icon(
                     Icons.Filled.Shuffle,
@@ -722,15 +739,7 @@ private fun ExpandedNowPlaying(
             }
             IconButton(
                 onClick = onRepeat,
-                modifier = Modifier.semantics {
-                    stateDescription = stringResource(
-                        when (nowPlaying.repeatMode) {
-                            RepeatMode.ALL -> R.string.state_repeat_all
-                            RepeatMode.ONE -> R.string.state_repeat_one
-                            RepeatMode.OFF -> R.string.state_repeat_off
-                        },
-                    )
-                },
+                modifier = Modifier.semantics { stateDescription = repeatStateLabel },
             ) {
                 Icon(
                     Icons.Filled.Repeat,
@@ -757,6 +766,7 @@ private fun ExpandedNowPlaying(
  * simply false. Callers read it inside `graphicsLayer`/`drawWithContent`, where a
  * write invalidates only the draw phase.
  */
+@Composable
 private fun rememberFrameSyncedPosition(
     positionMs: () -> Long,
     isPlaying: Boolean,
@@ -787,6 +797,7 @@ private fun rememberFrameSyncedPosition(
  * TalkBack announced an unlabelled element with no position and no way to seek. The
  * two custom actions were also wired to a no-op lambda.
  */
+@Composable
 private fun SeekBar(
     positionMs: () -> Float,
     durationMs: Long,
@@ -798,6 +809,9 @@ private fun SeekBar(
     val elapsed = formatTime((positionMs() / 1000f).toInt())
     val total = formatTime((durationMs / 1000).toInt())
     val timeDescription = stringResource(R.string.cd_time_elapsed_total, elapsed, total)
+    // Hoisted out of the semantics lambda, which is not @Composable.
+    val skipForwardLabel = stringResource(R.string.action_skip_forward)
+    val skipBackLabel = stringResource(R.string.action_skip_back)
 
     Column(
         Modifier
@@ -814,11 +828,11 @@ private fun SeekBar(
                     true
                 }
                 customActions = listOf(
-                    CustomAccessibilityAction(stringResource(R.string.action_skip_forward)) {
+                    CustomAccessibilityAction(skipForwardLabel) {
                         onSeek((positionMs() + 5_000f).toLong())
                         true
                     },
-                    CustomAccessibilityAction(stringResource(R.string.action_skip_back)) {
+                    CustomAccessibilityAction(skipBackLabel) {
                         onSeek((positionMs() - 5_000f).coerceAtLeast(0f).toLong())
                         true
                     },
@@ -887,7 +901,9 @@ internal fun ArtworkPlaceholder(
     cornerRadius: androidx.compose.ui.unit.Dp = 16.dp,
     contentScale: ContentScale = ContentScale.Crop,
     applyCornerClip: Boolean = true,
-    contentDescription: String? = null,
+    // Named `label` rather than `contentDescription` so it does not shadow the
+    // SemanticsPropertyReceiver property inside the `semantics {}` block below.
+    label: String? = null,
 ) {
     val palette = LocalNoizPalette.current
     val clipped = if (applyCornerClip) {
@@ -899,7 +915,7 @@ internal fun ArtworkPlaceholder(
     Surface(
         modifier = clipped.semantics {
             // §13: artwork needs alternative text or a spoken description.
-            this.contentDescription = contentDescription
+            if (label != null) contentDescription = label
         },
         color = palette.muted,
     ) {
@@ -907,7 +923,7 @@ internal fun ArtworkPlaceholder(
             if (!url.isNullOrBlank()) {
                 AsyncImage(
                     model = url,
-                    contentDescription = contentDescription,
+                    contentDescription = label,
                     contentScale = contentScale,
                     modifier = Modifier.fillMaxSize(),
                 )

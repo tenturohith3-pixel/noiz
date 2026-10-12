@@ -4,6 +4,7 @@ import androidx.media3.common.Player
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -92,24 +93,25 @@ data class QueueEntry(
  */
 class EnginePlaybackController(
     private val engine: DualPlayerEngine,
-    private val queue: QueueController,
+    private val queueController: QueueController,
 ) : PlaybackController {
+
+    // A single scope shared by both flows so the adapter owns exactly one SupervisorJob.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     override val state: StateFlow<PlaybackState> =
         engine.snapshot.map { it.toPlaybackState() }.stateIn(
-            scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
+            scope = scope,
             started = SharingStarted.Eagerly,
             initialValue = engine.snapshot.value.toPlaybackState(),
         )
 
     override val queueFlow: StateFlow<List<QueueEntry>> =
         engine.snapshot.map { it.toQueueEntries() }.stateIn(
-            scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
+            scope = scope,
             started = SharingStarted.Eagerly,
             initialValue = engine.snapshot.value.toQueueEntries(),
         )
-
-    override val queue: StateFlow<List<QueueEntry>> get() = queueFlow
 
     override val isConnected: StateFlow<Boolean> = MutableStateFlow(true)
 
@@ -122,9 +124,12 @@ class EnginePlaybackController(
     override fun setShuffle(enabled: Boolean) = engine.setShuffleModeEnabled(enabled)
     override fun cycleRepeatMode() = engine.cycleRepeatMode()
 
-    override fun playQueueIndex(index: Int) = queue.playAt(index)
-    override fun removeFromQueue(index: Int) = queue.removeFrom(index)
-    override fun moveInQueue(from: Int, to: Int) = queue.move(from, to)
+    override fun playQueueIndex(index: Int) = queueController.playAt(index)
+    override fun removeFromQueue(index: Int) = queueController.removeFrom(index)
+    override fun moveInQueue(from: Int, to: Int) = queueController.move(from, to)
+
+    /** Stops the state collectors; call when the host screen goes away. */
+    fun release() = scope.cancel()
 
     private fun EngineSnapshot.toPlaybackState() = PlaybackState(
         current = toQueueEntries().getOrNull(currentIndex),
@@ -139,7 +144,7 @@ class EnginePlaybackController(
     )
 
     private fun EngineSnapshot.toQueueEntries(): List<QueueEntry> {
-        val unplayable = unplayableMediaIds()
+        val broken = engine.unplayableMediaIds()
         return queue.mapIndexed { idx, track ->
             QueueEntry(
                 index = idx,
@@ -150,7 +155,7 @@ class EnginePlaybackController(
                 artworkHash = null,
                 durationMs = track.durationMs,
                 isCurrent = idx == currentIndex,
-                unavailable = track.mediaItem.mediaId in unplayable,
+                unavailable = track.mediaItem.mediaId in broken,
             )
         }
     }

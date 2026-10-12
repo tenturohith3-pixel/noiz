@@ -1,14 +1,20 @@
 package com.noiz.download
 
 import android.content.Context
+import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.BaseDataSource
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadManager
 import androidx.media3.exoplayer.offline.DownloadNotificationHelper
 import androidx.media3.exoplayer.offline.DownloadRequest
 import androidx.media3.exoplayer.offline.DownloadService
+import androidx.media3.exoplayer.scheduler.PlatformScheduler
 import androidx.media3.exoplayer.scheduler.Scheduler
 import com.noiz.database.DownloadDao
 import com.noiz.database.DownloadEntity
@@ -185,7 +191,11 @@ class DownloadController(
  *
  * Media3 performs the atomic rename but never checks integrity, so a truncated or
  * corrupted transfer was previously reported as `COMPLETED` and only failed much later,
- * during playback. Hashing runs off the caller's thread, on the cached file.
+ * during playback.
+ *
+ * The bytes are read through a [CacheDataSource] rather than off disk: `SimpleCache` has
+ * no `getCachedFile`, and touching its span files directly would bypass the span locking
+ * that stops a concurrent download from mutating them mid-read.
  *
  * @return true when the bytes match, or when no hash is known for this rendition.
  */
@@ -199,21 +209,52 @@ suspend fun verifyDownloadChecksum(
     val expected = expectedSha256?.takeIf { it.isNotBlank() } ?: return@withContext true
 
     val key = "noiz/$trackId/$renditionId"
-    val span = runCatching { cache.getCachedSpans(key) }.getOrNull()?.firstOrNull()
-        ?: return@withContext true
+    val length = runCatching { cache.getCachedLength(key, 0L, C.LENGTH_UNSET.toLong()) }
+        .getOrNull()
+    if (length == null || length <= 0L) return@withContext true
 
-    val file = cache.getCachedFile(key, 0L, span.length)
     val actual = runCatching {
-        file.inputStream().use { stream ->
-            val digest = java.security.MessageDigest.getInstance("SHA-256")
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-                val read = stream.read(buffer)
-                if (read <= 0) break
-                digest.update(buffer, 0, read)
+        // A COMPLETED download must already be in the cache; this upstream only exists
+        // so a cache miss fails loudly instead of silently re-downloading. Media3 1.5.1
+        // has no EmptyDataSource, so it is spelled out here.
+        val failing: DataSource.Factory = DataSource.Factory {
+            object : BaseDataSource(/* isNetwork= */ false) {
+                override fun open(dataSpec: DataSpec): Long =
+                    throw java.io.IOException("Cache miss for $key")
+
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int = -1
+
+                override fun getUri(): android.net.Uri = android.net.Uri.EMPTY
+
+                override fun close() = Unit
             }
-            digest.digest().joinToString("") { "%02x".format(it) }
         }
+
+        val dataSource = CacheDataSource.Factory()
+            .setCache(cache)
+            .setUpstreamDataSourceFactory(failing)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+            .createDataSource()
+
+        // `DataSource.open` returns the length, not a stream — read from the source itself.
+        dataSource.open(
+            DataSpec.Builder()
+                .setUri(android.net.Uri.EMPTY)
+                .setKey(key)
+                .setPosition(0L)
+                .setLength(length)
+                .build(),
+        )
+
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+            val read = dataSource.read(buffer, 0, buffer.size)
+            if (read <= 0) break
+            digest.update(buffer, 0, read)
+        }
+        dataSource.close()
+        digest.digest().joinToString("") { byte -> "%02x".format(byte) }
     }.getOrNull() ?: return@withContext false
 
     val matches = actual.equals(expected, ignoreCase = true)
@@ -278,11 +319,28 @@ private class ProgressRecorder(
  * bytes are moving and stops it when the queue drains (§12.1).
  */
 @UnstableApi
-class NoizDownloadService : DownloadService() {
+class NoizDownloadService : DownloadService(
+    NOIZ_DOWNLOAD_NOTIFICATION_ID,
+    FOREGROUND_NOTIFICATION_UPDATE_INTERVAL_MS,
+    CHANNEL_ID,
+    /* channelDescriptionResourceId= */ R.string.noiz_download_channel,
+    /* channelNameResourceId= */ R.string.noiz_download_channel,
+) {
 
     override fun getDownloadManager(): DownloadManager = NoizDownloadManagerProvider.manager(this)
 
-    override fun getScheduler(): Scheduler? = null
+    /**
+     * Reschedules downloads across process death and reboot.
+     *
+     * `getScheduler()` is abstract in Media3 1.5.1 — it cannot return null, so the
+     * previous `= null` stub did not compile and, had it been nullable, would have
+     * silently disabled Doze-aware resumption (§12.1).
+     *
+     * [PlatformScheduler] is backed by `JobScheduler`, which is what we want here:
+     * the manifest deliberately strips SCHEDULE_EXACT_ALARM, and
+     * `AlarmManagerScheduler` would need it. JobScheduler also survives Doze properly.
+     */
+    override fun getScheduler(): Scheduler = NoizDownloadManagerProvider.scheduler(this)
 
     override fun getForegroundNotification(
         downloads: List<Download>,
@@ -300,6 +358,9 @@ class NoizDownloadService : DownloadService() {
 
     companion object {
         const val CHANNEL_ID = "noiz_downloads"
+
+        /** Progress refresh cadence for the foreground notification. */
+        private const val FOREGROUND_NOTIFICATION_UPDATE_INTERVAL_MS = 2_000L
     }
 }
 
@@ -319,6 +380,9 @@ object NoizDownloadManagerProvider {
     @Volatile
     private var cached: DownloadManager? = null
 
+    @Volatile
+    private var cachedScheduler: Scheduler? = null
+
     fun install(factory: (Context) -> DownloadManager) {
         this.factory = factory
         cached = null
@@ -330,4 +394,18 @@ object NoizDownloadManagerProvider {
                 "NoizDownloadManagerProvider.install(...) must run in NoizApplication.onCreate"
             }(context.applicationContext).also { cached = it }
         }
+
+    /**
+     * One [PlatformScheduler] per process.
+     *
+     * `DownloadService.getScheduler()` is abstract and called on every service start, so
+     * a fresh instance per call would re-register the JobScheduler job each time.
+     */
+    fun scheduler(context: Context): Scheduler =
+        cachedScheduler ?: synchronized(this) {
+            cachedScheduler ?: PlatformScheduler(context.applicationContext, SCHEDULER_ID)
+                .also { cachedScheduler = it }
+        }
+
+    private const val SCHEDULER_ID = 0x4E4F49 // 'NOI'
 }

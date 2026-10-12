@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Shown in Android's notification-channel settings. Media3's DownloadService takes
+         separate name and description resource ids; both point here. -->
     <string name="noiz_download_channel">Downloads</string>
     <string name="noiz_download_title">Downloading music</string>
 </resources>

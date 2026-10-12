@@ -181,9 +181,15 @@ class NormalizationProcessor(
          * Sanity bounds on applied gain. EBU R128 treats anything under roughly −70
          * LUFS as unmeasurable; a corrupt metadata value could otherwise ask for ~99 dB
          * of boost (~89 000× linear).
+         *
+         * Computed from dB rather than literal floats because `const val` requires a
+         * compile-time constant and `10f.pow(...)` is not one.
          */
-        private const val MIN_LINEAR_GAIN = 10f.pow(-30f / 20f)
-        private const val MAX_LINEAR_GAIN = 10f.pow(12f / 20f)
+        private val MIN_LINEAR_GAIN = 10f.pow(MIN_LINEAR_GAIN_DB / 20f)
+        private val MAX_LINEAR_GAIN = 10f.pow(MAX_BOOST_DB / 20f)
+
+        /** Never attenuate past this; the track is already far too quiet. */
+        private const val MIN_LINEAR_GAIN_DB = -30f
 
         /** R128 cannot measure below this; treat anything lower as missing metadata. */
         const val MEASURABLE_FLOOR_LUFS = -70f

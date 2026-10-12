@@ -157,8 +157,9 @@ object AppGraph {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return true
         val network = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(network) ?: return false
-        return caps.hasCapability(NetworkCapabilities.NETWORK_CAPABILITY_VALIDATED) ||
-            caps.hasCapability(NetworkCapabilities.NETWORK_CAPABILITY_INTERNET)
+        // The constants are NET_CAPABILITY_* (not NETWORK_CAPABILITY_*).
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ||
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
     // -----------------------------------------------------------------------
@@ -296,8 +297,16 @@ object AppGraph {
                 .build(),
         )
         .setRequestMetadata(
+            // RequestMetadata.Builder takes a whole Bundle; there is no putExtra.
+            // NoizPlayer reads these back off `requestMetadata.extras` to rebuild the
+            // EngineTrack (duration, loudness, gapless flag) after process death.
             MediaItem.RequestMetadata.Builder()
-                .putExtra("noiz.durationMs", durationMs)
+                .setExtras(
+                    android.os.Bundle().apply {
+                        putLong("noiz.durationMs", durationMs)
+                        putString("noiz.rendition", "orig")
+                    },
+                )
                 .build(),
         )
         .build()

@@ -97,7 +97,7 @@ class UploadWorker @AssistedInject constructor(
                     partNumber++
                 }
 
-                api.completeUpload(session.id, CompleteUploadRequestDto(sha = checksum))
+                api.completeUpload(session.id, CompleteUploadRequestDto(sha256 = checksum))
                 Result.success(Data.Builder().putString(KEY_TRACK_HINT, displayName).build())
             }
         } catch (http: retrofit2.HttpException) {

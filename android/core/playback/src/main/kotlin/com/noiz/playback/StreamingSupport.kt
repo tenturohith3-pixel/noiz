@@ -1,6 +1,7 @@
 package com.noiz.playback
 
 import android.net.Uri
+import androidx.media3.common.C
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
@@ -81,6 +82,21 @@ class NoizLoadErrorHandlingPolicy(
 ) : DefaultLoadErrorHandlingPolicy() {
 
     override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+        // An expired or revoked signature must be re-minted, not blindly retried.
+        // Media3 1.5.1 has no `shouldRetryLoadException` hook, so the decision happens
+        // here: a 401/403 invalidates the cached signature and retries almost
+        // immediately so the next DataSpec resolve mints a fresh one.
+        (loadErrorInfo.exception as? HttpDataSource.InvalidResponseCodeException)?.let { httpError ->
+            when (httpError.responseCode) {
+                401, 403 -> {
+                    invalidateSignature(httpError.dataSpec.uri)
+                    return AUTH_RETRY_MS
+                }
+                // The rendition is gone for good; retrying cannot help.
+                404, 410 -> return C.TIME_UNSET
+            }
+        }
+
         val attempt = loadErrorInfo.errorCount - 1
         if (!isValidatedNetwork()) return RETRY_WHILE_OFFLINE_MS
 
@@ -91,36 +107,12 @@ class NoizLoadErrorHandlingPolicy(
         }
     }
 
-    /**
-     * An expired or revoked signature must be re-minted, not retried. Media3 treats
-     * every status except 404/410 as retryable, so without this the same dead URL was
-     * retried up to 20 times and the track never recovered.
-     */
-    override fun shouldRetryLoadException(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Boolean {
-        val error = loadErrorInfo.error
-        if (error is HttpDataSource.InvalidResponseCodeException) {
-            when (error.responseCode) {
-                401, 403 -> {
-                    // Parse noiz://track/{id}/{rendition} to find which token died.
-                    val uri = error.uri
-                    if (uri.scheme == SignedUrlResolver.NOIZ_SCHEME) {
-                        val id = uri.pathSegments.getOrNull(0)
-                        val rendition = uri.pathSegments.getOrNull(1)
-                            ?: SignedUrlResolver.RENDITION_ORIG
-                        if (id != null) {
-                            tokenStore?.invalidate(id, rendition)
-                            return true
-                        }
-                    }
-                }
-
-                410 -> {
-                    // The rendition is gone for good; retrying cannot help.
-                    return false
-                }
-            }
-        }
-        return super.shouldRetryLoadException(loadErrorInfo)
+    private fun invalidateSignature(uri: Uri?) {
+        val target = uri ?: return
+        if (target.scheme != SignedUrlResolver.NOIZ_SCHEME) return
+        val id = target.pathSegments.getOrNull(0) ?: return
+        val rendition = target.pathSegments.getOrNull(1) ?: SignedUrlResolver.RENDITION_ORIG
+        tokenStore?.invalidate(id, rendition)
     }
 
     override fun getMinimumLoadableRetryCount(dataType: Int): Int = MAX_RETRIES
@@ -130,5 +122,8 @@ class NoizLoadErrorHandlingPolicy(
         const val LONG_RETRY_MS = 10_000L
         const val RETRY_WHILE_OFFLINE_MS = 5_000L
         const val MAX_RETRIES = 20
+
+        /** After a 401/403 the next resolve mints a new signature; retry at once. */
+        private const val AUTH_RETRY_MS = 0L
     }
 }

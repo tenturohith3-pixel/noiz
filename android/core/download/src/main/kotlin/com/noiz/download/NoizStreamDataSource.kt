@@ -28,9 +28,9 @@ fun buildNoizDownloadManager(
 ): DownloadManager {
     val upstream = ResolvingUrlDataSource.Factory(
         base = OkHttpDataSource.Factory(okHttpClient),
-        resolve = { dataSpec ->
+        resolve = lambda@{ dataSpec ->
             val segments = dataSpec.uri.pathSegments
-            val trackId = segments.getOrNull(0) ?: return@ResolvingUrlDataSource dataSpec
+            val trackId = segments.getOrNull(0) ?: return@lambda dataSpec
             val rendition = segments.getOrNull(1) ?: "orig"
             val signed = resolver(trackId, rendition)
             if (signed.isNullOrBlank()) {

@@ -5,16 +5,17 @@ import android.media.AudioManager
 import android.os.Build
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
-import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.common.audio.ChannelMixingAudioProcessor
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.SonicAudioProcessor
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.DefaultExtractorsFactory
 import okhttp3.OkHttpClient
@@ -52,30 +53,6 @@ class ExoPlayerAssembler(
         normalizer: NormalizationProcessor,
     ): ExoPlayer {
         val renderers = object : DefaultRenderersFactory(context) {
-            /**
-             * Appends the normalizer to Media3's *own* default chain.
-             *
-             * `DefaultAudioProcessorChain(vararg)` replaces the chain rather than
-             * appending, so passing only the normalizer silently removed resampling and
-             * channel downmix — playback then breaks or sounds wrong on any device whose
-             * native output rate differs from the source. Overriding this hook keeps the
-             * defaults (Sonic resampler, channel handling) and adds our gain stage.
-             */
-            override fun getDefaultAudioProcessorChain(
-                context: Context,
-                enableFloatOutput: Boolean,
-                enableAudioTrackPlaybackParams: Boolean,
-            ): List<AudioProcessor> {
-                val defaults = super.getDefaultAudioProcessorChain(
-                    context,
-                    enableFloatOutput,
-                    enableAudioTrackPlaybackParams,
-                )
-                // Gain belongs *after* resampling, so the limiter sees the signal at the
-                // device's actual rate.
-                return defaults + normalizer
-            }
-
             override fun buildAudioSink(
                 context: Context,
                 enableFloatOutput: Boolean,
@@ -84,6 +61,20 @@ class ExoPlayerAssembler(
                 DefaultAudioSink.Builder(context)
                     // float PCM keeps 24-bit sources intact through the DSP chain
                     .setEnableFloatOutput(enableFloatOutput)
+                    .setAudioProcessorChain(
+                        DefaultAudioSink.DefaultAudioProcessorChain(
+                            // The default chain (Sonic resampler + channel handling) comes
+                            // first so Media3 still resamples to the device's native rate;
+                            // our gain stage runs afterwards on the signal at its real
+                            // rate. `DefaultRenderersFactory` in 1.5.1 exposes no hook to
+                            // fetch that chain, so it is listed explicitly — replacing it
+                            // with the normalizer alone removed resampling and broke
+                            // playback whenever the source rate differed from the device.
+                            SonicAudioProcessor(),
+                            ChannelMixingAudioProcessor(),
+                            normalizer,
+                        ),
+                    )
                     .build()
         }.setEnableAudioFloatOutput(true)
 
@@ -100,12 +91,15 @@ class ExoPlayerAssembler(
         val extractors = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)                  // VBR MP3 without a Xing header
 
-        return ExoPlayer.Builder(context, renderers)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(cacheFactory, extractors))
-            // Without this the whole NoizLoadErrorHandlingPolicy is discarded and
-            // Media3's default applies: 1/2/3/4/5/5 s then give up after ~6 tries. §12.3
-            // wants a transient dropout to survive, not kill playback.
+        // Without this Media3 uses its default policy (1/2/3/4/5/5 s, then give up after ~6
+        // tries), so a transient dropout killed playback instead of surviving it (§12.3).
+        // Media3 1.5.1 accepts the policy on the MediaSourceFactory — ExoPlayer.Builder
+        // has no such setter.
+        val mediaSourceFactory = DefaultMediaSourceFactory(cacheFactory, extractors)
             .setLoadErrorHandlingPolicy(errorPolicy)
+
+        return ExoPlayer.Builder(context, renderers)
+            .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(
                 DefaultLoadControl.Builder()
                     .setBufferDurationsMs(20_000, 60_000, 1_000, 3_000)   // min, max, start, rebuffer

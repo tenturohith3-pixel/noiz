@@ -358,13 +358,16 @@ class NoizClientFactory(
         Retrofit.Builder()
             // Placeholder: every call carries an absolute URL or is resolved by the
             // interceptor against the user-configured server.
-            .baseUrl("https://noiz.invalid/")
+            .baseUrl(PLACEHOLDER_BASE_URL)
             .client(apiClient)
-            .addConverterFactory(
-                NoizJsonConverterFactory.create()
-            )
+            .addConverterFactory(NoizJsonConverterFactory.create())
             .build()
             .create(NoizApi::class.java)
+    }
+
+    private companion object {
+        /** Rewritten to the real server by [AuthInterceptor]; see [PLACEHOLDER_HOST]. */
+        const val PLACEHOLDER_BASE_URL = "https://noiz.invalid/"
     }
 
     val streamManifests: StreamManifestSource by lazy {

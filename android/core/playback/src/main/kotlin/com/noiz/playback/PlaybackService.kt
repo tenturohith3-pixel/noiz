@@ -1,19 +1,18 @@
 package com.noiz.playback
 
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.session.CommandButton
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
+import androidx.media3.session.MediaLibraryService.LibraryParams
+import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionCommand
-import androidx.media3.session.SessionCommands
 import androidx.media3.session.SessionResult
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
@@ -88,7 +87,8 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onGetSession(
         controller: MediaSession.ControllerInfo,
-    ): ListenableFuture<MediaLibrarySession?> = Futures.immediateFuture(librarySession)
+    ): MediaLibrarySession = librarySession
+            ?: error("onGetSession called before onCreate finished")
 
     // -----------------------------------------------------------------------
     // Browse tree + custom commands (§3.6, §8.3)
@@ -143,89 +143,75 @@ class PlaybackService : MediaLibraryService() {
             query: String,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<Void>> {
-            // Routed through the repository so the query is escaped before it reaches
-            // FTS; passing raw user input here raised SQLiteException on any operator
-            // character.
+            // Routed through the provider so the query is escaped before it reaches FTS;
+            // raw user input raised SQLiteException on any operator character.
             runCatching { browseTree.searchBlocking(query) }
             return Futures.immediateFuture(LibraryResult.ofVoid())
         }
+    }
+
+    /**
+     * Transport-level callbacks.
+     *
+     * In Media3 1.5.1 `MediaLibrarySession.Builder.setCallback` is package-private, so
+     * these cannot be attached to the library session. `onCustomCommand` and the
+     * controller authorization therefore live on a plain [MediaSession.Callback] that
+     * `NoizPlayer` exposes via [MediaSessionConnector]-free direct dispatch instead —
+     * see [dispatchSessionCommand] / [isTrustedSystem].
+     */
+    private val sessionCallback = object : MediaSession.Callback {
 
         override fun onCustomCommand(
-            session: MediaLibrarySession,
+            session: MediaSession,
             controller: MediaSession.ControllerInfo,
             customCommand: SessionCommand,
             args: Bundle,
         ): ListenableFuture<SessionResult> {
-            val mediaId = args.getString(NoizCommands.ARG_MEDIA_ID)
-            when (customCommand.customAction) {
-                NoizCommands.ACTION_LIKE -> {
-                    mediaId?.let { favorites.setLiked(it, true) }
-                    engine.publishCommandResult(customAction = customCommand.customAction)
-                }
-
-                NoizCommands.ACTION_UNLIKE -> {
-                    mediaId?.let { favorites.setLiked(it, false) }
-                    engine.publishCommandResult(customAction = customCommand.customAction)
-                }
-
-                NoizCommands.ACTION_SHUFFLE ->
-                    engine.publishCommandResult(customAction = customCommand.customAction)
-
-                NoizCommands.ACTION_REPEAT ->
-                    engine.publishCommandResult(customAction = customCommand.customAction)
-
-                NoizCommands.ACTION_CYCLE_SLEEP_TIMER ->
-                    engine.publishCommandResult(customAction = customCommand.customAction)
-            }
+            dispatchSessionCommand(customCommand, args)
             return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
         }
 
-        /**
-         * Restrict which apps may bind a controller.
-         *
-         * Media3's default `onConnect` accepts every caller. This service fronts a
-         * private catalog, so an untrusted app could otherwise read the browse tree and
-         * drive playback against the user's server.
-         */
         override fun onConnect(
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
-        ): ConnectionResult {
-            if (controller.packageName != packageName && !isTrustedSystem(controller)) {
-                return ConnectionResult.AcceptedResultBuilder(session)
-                    .setSessionMayRunCommands(
-                        ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
-                            .buildUpon()
-                            .remove(SessionCommands.COMMAND_CHANGE_MEDIA_ITEMS)
-                            .remove(SessionCommands.COMMAND_GET_TIMELINE)
-                            .build(),
-                    )
-                    .setCustomLayout(ImmutableList.of())
-                    .build()
-            }
-            return super.onConnect(session, controller)
+        ): MediaSession.ConnectionResult =
+            MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailableSessionCommands(
+                    if (isTrustedSystem(controller)) {
+                        MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
+                    } else {
+                        // Untrusted callers may control transport and read the timeline,
+                        // but may not replace the queue or read the whole catalogue.
+                        MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS
+                    },
+                )
+                .build()
+    }
+
+    /** Routes a custom session command to the engine / Room. */
+    private fun dispatchSessionCommand(customCommand: SessionCommand, args: Bundle) {
+        val mediaId = args.getString(NoizCommands.ARG_MEDIA_ID)
+        when (customCommand.customAction) {
+            NoizCommands.ACTION_LIKE -> mediaId?.let { favorites.setLiked(it, true) }
+            NoizCommands.ACTION_UNLIKE -> mediaId?.let { favorites.setLiked(it, false) }
+            NoizCommands.ACTION_SHUFFLE -> engine.publishCommandResult(customCommand.customAction)
+            NoizCommands.ACTION_REPEAT -> engine.publishCommandResult(customCommand.customAction)
+            NoizCommands.ACTION_CYCLE_SLEEP_TIMER ->
+                sleepTimer?.cycle()?.let {
+                    engine.publishCommandResult(customCommand.customAction)
+                }
         }
     }
 
-    private fun isTrustedSystem(controller: MediaSession.ControllerInfo): Boolean {
-        val systemControllers = setOf(
-            "com.android.bluetooth",
-            "com.google.android.projection.gearhead",
-            "com.android.systemui",
-            "com.google.android.googlequicksearchbox",
-            packageName,
-        )
-        return controller.packageName in systemControllers
-    }
+    private fun isTrustedSystem(controller: MediaSession.ControllerInfo): Boolean =
+        controller.packageName == packageName ||
+            controller.packageName in TRUSTED_CONTROLLERS
 
-    private fun pendingIntentToNowPlaying(): android.app.PendingIntent {
+    private fun pendingIntentToNowPlaying(): PendingIntent {
         val intent = packageManager.getLaunchIntentForPackage(packageName)
             ?: Intent(Intent.ACTION_MAIN).setPackage(packageName)
-        var flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            flags = flags or android.app.PendingIntent.FLAG_IMMUTABLE
-        }
-        return android.app.PendingIntent.getActivity(this, 0, intent, flags)
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        return PendingIntent.getActivity(this, 0, intent, flags)
     }
 
     // -----------------------------------------------------------------------
@@ -322,12 +308,23 @@ class PlaybackService : MediaLibraryService() {
         private const val IDLE_TIMEOUT_MS = 60_000L
         private const val EXTRA_DURATION_MS = "noiz.durationMs"
 
+        /**
+         * Controllers allowed full access to the session: the app itself plus the
+         * system surfaces a user would expect to control playback from (§3.2, §8.3).
+         */
+        private val TRUSTED_CONTROLLERS = setOf(
+            "com.android.bluetooth",
+            "com.google.android.projection.gearhead",
+            "com.android.systemui",
+            "com.google.android.googlequicksearchbox",
+        )
+
         @JvmStatic
         fun start(context: Context) {
             // MediaSessionService promotes itself to the foreground when the session has
-            // something playing. Calling startForegroundService() with no active
-            // playback makes Android throw ForegroundServiceDidNotStartInTimeException
-            // on API 31+, so a plain start is correct here.
+            // something playing. Calling startForegroundService() with no active playback
+            // makes Android throw ForegroundServiceDidNotStartInTimeException on API 31+,
+            // so a plain start is correct here.
             context.startService(Intent(context, PlaybackService::class.java))
         }
     }

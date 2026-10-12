@@ -22,6 +22,9 @@ dependencies {
     api(libs.media3.exoplayer)
     api(libs.media3.datasource)
     api(libs.media3.common)
+    // Required by NoizStreamDataSource: OkHttpDataSource.Factory and OkHttpClient.
+    api(libs.media3.datasource.okhttp)
+    api(libs.okhttp)
     implementation(libs.work.runtime.ktx)
     implementation(libs.kotlinx.coroutines.android)
 }

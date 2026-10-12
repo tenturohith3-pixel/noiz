@@ -167,16 +167,23 @@ override fun handleSetMediaItems(
         return Futures.immediateVoidFuture()
     }
 
-    private fun MediaItem.toEngineTrack(): EngineTrack {
-        val request = requestMetadata
+    /**
+ * Reads the engine metadata that travels with a `MediaItem`.
+ *
+ * `MediaItem.requestMetadata` is a `RequestMetadata`, not a Bundle — the Bundle lives
+ * at `requestMetadata.extras`, which is where `MediaItem.Builder.setRequestMetadata`
+ * puts anything passed through. `MediaItemData`/`durationMs` are not available here
+ * because only the incoming `MediaItem` is.
+ */
+private fun MediaItem.toEngineTrack(): EngineTrack {
+        val extras = requestMetadata?.extras
         return EngineTrack(
             mediaItem = this,
-            renditionId = request?.getString(KEY_RENDITION) ?: EngineTrack.DEFAULT_RENDITION,
-            loudnessLufs = request?.getFloatOrNull(KEY_LOUDNESS_LUFS),
-            truePeakDb = request?.getFloatOrNull(KEY_TRUE_PEAK_DB),
-            gaplessNext = request?.getBoolean(KEY_GAPLESS_NEXT) ?: false,
-            durationMs = request?.getLong(KEY_DURATION_MS)
-                ?: if (localConfiguration != null) durationMs else 0L,
+            renditionId = extras?.getString(KEY_RENDITION) ?: EngineTrack.DEFAULT_RENDITION,
+            loudnessLufs = extras?.getFloatOrNull(KEY_LOUDNESS_LUFS),
+            truePeakDb = extras?.getFloatOrNull(KEY_TRUE_PEAK_DB),
+            gaplessNext = extras?.getBoolean(KEY_GAPLESS_NEXT) ?: false,
+            durationMs = extras?.getLong(KEY_DURATION_MS) ?: 0L,
         )
     }
 

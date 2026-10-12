@@ -1,8 +1,8 @@
 package com.noiz.network
 
-import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import okhttp3.MediaType.Companion.toMediaType
 import retrofit2.Converter
+import retrofit2.converter.kotlinx.serialization.asConverterFactory
 
 /**
  * Retrofit converter backed by kotlinx.serialization (§4.2).

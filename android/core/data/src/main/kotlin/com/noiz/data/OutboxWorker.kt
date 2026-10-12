@@ -70,6 +70,25 @@ interface SyncApi {
     suspend fun pushPlayEvents(@Body body: PlayEventsRequest)
 }
 
+/**
+ * Builds [SyncApi] on the *same* authenticated OkHttp client as the main API, so the
+ * workers get the Authorization header, token refresh and base-URL rewriting for free.
+ *
+ * Lives here rather than on `NoizClientFactory` because `:core:network` cannot depend on
+ * `:core:data` — the dependency runs the other way (`core:data` api's `core:network`),
+ * so putting it there would be a cycle.
+ */
+fun createSyncApi(apiClient: okhttp3.OkHttpClient): SyncApi =
+    retrofit2.Retrofit.Builder()
+        .baseUrl(SYNC_PLACEHOLDER_BASE_URL)
+        .client(apiClient)
+        .addConverterFactory(com.noiz.network.NoizJsonConverterFactory.create())
+        .build()
+        .create(SyncApi::class.java)
+
+/** Rewritten to the real server by `AuthInterceptor`; see `NoizClientFactory`. */
+private const val SYNC_PLACEHOLDER_BASE_URL = "https://noiz.invalid/"
+
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
