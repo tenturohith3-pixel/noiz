@@ -180,7 +180,9 @@ async def stream_manifest(
         signature, expires_at = security.sign_stream_url(
             settings,
             user_id=principal.user_id,
-            track_id=track_id,
+            # Must be a str: the signature message is JSON-encoded, and a raw UUID
+            # makes json.dumps raise TypeError, so every stream URL 500'd.
+            track_id=str(track_id),
             rendition=rendition["id"],
         )
         payload_renditions.append(

@@ -302,11 +302,42 @@ class PlaybackService : MediaLibraryService() {
         super.onDestroy()
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // The Library screen starts the service with an explicit queue; the MediaSession
+        // then owns it for the notification, Bluetooth and Android Auto.
+        if (intent?.action == ACTION_PLAY) {
+            val ids = intent.getStringArrayListExtra(EXTRA_TRACK_IDS).orEmpty()
+            val startIndex = intent.getIntExtra(EXTRA_START_INDEX, 0)
+            if (ids.isNotEmpty()) {
+                val resolved = runCatching { browseTree.resolveBlocking(ids) }.getOrNull().orEmpty()
+                if (resolved.isNotEmpty()) {
+                    engine.setQueue(
+                        resolved.map { item ->
+                            EngineTrack(
+                                mediaItem = item,
+                                renditionId = EngineTrack.DEFAULT_RENDITION,
+                                durationMs = item.mediaMetadata.extras?.getLong(EXTRA_DURATION_MS) ?: 0L,
+                            )
+                        },
+                        startIndex.coerceIn(0, resolved.lastIndex),
+                    )
+                    engine.play()
+                }
+            }
+        }
+        return super.onStartCommand(intent, flags, startId)
+    }
+
     companion object {
         private const val POSITION_PERSIST_INTERVAL_MS = 5_000L
         private const val IDLE_POLL_INTERVAL_MS = 2_000L
         private const val IDLE_TIMEOUT_MS = 60_000L
         private const val EXTRA_DURATION_MS = "noiz.durationMs"
+
+        /** Start the service with a queue resolved from local track ids. */
+        const val ACTION_PLAY = "com.noiz.playback.PLAY"
+        const val EXTRA_TRACK_IDS = "track_ids"
+        const val EXTRA_START_INDEX = "start_index"
 
         /**
          * Controllers allowed full access to the session: the app itself plus the

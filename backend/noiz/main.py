@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from noiz.api.v1 import auth, stream
+from noiz.api.v1 import auth, catalog, stream
 from noiz.core.db import close_pool, get_pool, init_pool, require_extensions
 from noiz.core.settings import Settings, get_settings
 
@@ -217,6 +217,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Versioned API surface.
     app.include_router(auth.router, prefix="/api/v1")
+    app.include_router(catalog.router, prefix="/api/v1")
     app.include_router(stream.router, prefix="/api/v1")
 
     # Streaming and artwork live at the root, so a signed URL can be handed straight to

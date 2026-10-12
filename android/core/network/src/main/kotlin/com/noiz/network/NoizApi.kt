@@ -125,6 +125,13 @@ interface NoizApi {
      * Renditions + freshly signed URLs (§9.4). Called from ExoPlayer's loading thread,
      * so it is `suspend` and run through [await] rather than blocking a dispatcher.
      */
+    /** Full catalogue listing used by the Library screen (§7.1). */
+    @GET("api/v1/catalog/tracks")
+    suspend fun catalogTracks(
+        @Query("limit") limit: Int = 100,
+        @Query("offset") offset: Int = 0,
+    ): CatalogTracksDto
+
     @GET("api/v1/tracks/{trackId}/stream-manifest")
     suspend fun streamManifest(@Path("trackId") trackId: String): StreamManifestDto
 

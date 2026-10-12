@@ -260,6 +260,13 @@ data class CatalogPageDto(
 // Playback / streaming (§6.2, §9.4)
 // -------------------------------------------------------------------------------
 
+/** Response of `GET /api/v1/catalog/tracks`. */
+@Serializable
+data class CatalogTracksDto(
+    val tracks: List<TrackDto> = emptyList(),
+    val total: Int = 0,
+)
+
 @Serializable
 data class StreamManifestRenditionDto(
     val id: String,

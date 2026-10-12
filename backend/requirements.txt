@@ -18,6 +18,12 @@ redis==5.2.1
 mutagen==1.47.0
 httpx==0.28.1
 
+# Migrations — the image copies alembic.ini + migrations/, so it must be able to
+# run `alembic upgrade head`. Without these the container starts with no schema.
+alembic==1.14.0
+SQLAlchemy[asyncio]==2.0.36
+greenlet==3.1.1
+
 # Ops
 structlog==24.4.0
 prometheus-client==0.21.1

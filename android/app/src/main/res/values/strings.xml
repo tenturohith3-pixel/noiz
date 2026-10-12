@@ -55,4 +55,17 @@
     <string name="quality_saver">Data saver</string>
     <string name="quality_offline_lossless">Offline lossless</string>
     <string name="quality_unknown">Quality unknown</string>
+
+    <!-- Connect / sign in (§3.2 first connection) -->
+    <string name="connect_tagline">Your music, your server</string>
+    <string name="connect_server">Server address</string>
+    <string name="connect_username">Username</string>
+    <string name="connect_password">Password</string>
+    <string name="connect_sign_in">Sign in</string>
+    <string name="connect_connecting">Signing in…</string>
+    <string name="connect_loading">Loading your library…</string>
+    <string name="connect_empty">No tracks on this server yet</string>
+    <string name="connect_retry">Retry</string>
+    <string name="connect_sign_out">Sign out</string>
+    <string name="cd_loading">Loading</string>
 </resources>

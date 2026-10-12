@@ -21,10 +21,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY noiz ./noiz
-# `alembic.ini` / `migrations/` are not in the tree yet, and `COPY` of a missing path
-# is a hard build failure. Uncomment both lines once the baseline migration lands.
-# COPY alembic.ini ./alembic.ini
-# COPY migrations ./migrations
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 
 # Ingest runs as an unprivileged user with no write access outside the job dir (§12).
 # /media and /inbox must be chowned too: Docker initialises named volumes from the
