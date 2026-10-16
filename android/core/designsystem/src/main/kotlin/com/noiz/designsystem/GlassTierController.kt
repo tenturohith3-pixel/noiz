@@ -115,12 +115,15 @@ class GlassTierController(
             constraints.value = constraints.value + GlassTierConstraint.BatterySaver
         }
 
-        val am = appContext.getSystemService<AccessibilityManager>()
-        am?.let { manager ->
-            val extra = buildSet {
-                if (manager.isHighContrastTextEnabled) add(GlassTierConstraint.HighContrast)
+        // `AccessibilityManager.isHighContrastTextEnabled` was added in API 34. Calling
+        // it unguarded throws NoSuchMethodError on anything older — minSdk here is 29,
+        // so this crashed on launch on real devices and on the API-34 emulator image
+        // the method is present but the class in the boot classpath may not be.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val am = appContext.getSystemService<AccessibilityManager>()
+            if (am != null && am.isHighContrastTextEnabled) {
+                constraints.value = constraints.value + GlassTierConstraint.HighContrast
             }
-            if (extra.isNotEmpty()) constraints.value = constraints.value + extra
         }
         // Thermal listener + BatterySaver receiver are wired in :app so this module
         // stays free of manifest registrations; both call setConstraint(...).

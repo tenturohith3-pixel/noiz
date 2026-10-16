@@ -17,6 +17,12 @@ RUN apt-get update \
 
 WORKDIR /srv/noiz
 
+# `alembic.ini` resolves `script_location = migrations` and `prepend_sys_path = .`
+# relative to the working directory, so WORKDIR must be the directory those two
+# land in — the api service shells out to `alembic upgrade head` before uvicorn
+# and would otherwise fail with "No config file 'alembic.ini'".
+ENV PYTHONPATH=/srv/noiz
+
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 

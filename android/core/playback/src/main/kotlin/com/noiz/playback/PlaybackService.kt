@@ -210,7 +210,14 @@ class PlaybackService : MediaLibraryService() {
     private fun pendingIntentToNowPlaying(): PendingIntent {
         val intent = packageManager.getLaunchIntentForPackage(packageName)
             ?: Intent(Intent.ACTION_MAIN).setPackage(packageName)
-        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        // FLAG_IMMUTABLE was added in API 23; minSdk is 29 so this is always safe, but
+        // building it conditionally documents why the constant is legal here.
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                PendingIntent.FLAG_IMMUTABLE
+            } else {
+                0
+            }
         return PendingIntent.getActivity(this, 0, intent, flags)
     }
 

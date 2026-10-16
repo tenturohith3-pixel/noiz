@@ -30,7 +30,20 @@ services:
   api:
     build: ./backend
     restart: unless-stopped
-    command: uvicorn noiz.main:app --host 0.0.0.0 --port 8000 --workers 2
+    # `alembic upgrade head` must run before uvicorn binds. Nothing else applies
+    # the baseline revision, so without this the API comes up against an empty
+    # database and every /api/v1 route 500s.
+    #
+    # `exec` hands the PID to uvicorn rather than leaving `sh` in the way, so
+    # SIGTERM from `docker stop` reaches the server and it drains cleanly.
+    command:
+      - sh
+      - -c
+      - >-
+        alembic upgrade head &&
+        exec uvicorn noiz.main:app
+        --host 0.0.0.0 --port 8000 --workers 2
+        --proxy-headers --forwarded-allow-ips '*'
     env_file: .env
     environment: *api-env
     volumes:
@@ -52,6 +65,8 @@ services:
     # Analysis is best-effort: keep it below interactive work (PRD §2.3).
     cpu_shares: 512
     depends_on:
+      # service_healthy, not service_started: the prefork children each build an
+      # asyncpg pool at boot and a not-yet-ready Postgres fails the connection.
       postgres: { condition: service_healthy }
       redis: { condition: service_started }
 
@@ -62,6 +77,24 @@ services:
     env_file: .env
     environment: *api-env
     depends_on: [redis]
+
+  # One-shot bootstrap: default admin + initial library import.
+  # Not started by `docker compose up`; run it explicitly:
+  #     SEED_SOURCE_PATH=/home/rohith/Music \
+  #       docker compose --profile seed run --rm seed
+  seed:
+    build: ./backend
+    profiles: ["seed"]
+    command: >-
+      sh -c 'python -m noiz.ingest.seed --source "$${SEED_SOURCE_PATH:-/seed-source}"'
+    env_file: .env
+    environment: *api-env
+    volumes:
+      # Read-write: seeding copies into /media/library and writes catalog rows.
+      - media:/media
+      - ${SEED_SOURCE_PATH:-./seed-source}:/seed-source:ro
+    depends_on:
+      postgres: { condition: service_healthy }
 
   postgres:
     image: pgvector/pgvector:pg16

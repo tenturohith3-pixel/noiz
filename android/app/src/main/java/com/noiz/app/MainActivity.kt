@@ -270,7 +270,18 @@ private fun ObservePlatformGlassSignals(controller: GlassTierController) {
         val receiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(ctx: android.content.Context, intent: android.content.Intent) = publish()
         }
-        context.registerReceiver(receiver, IntentFilterPowerSave)
+        // API 34+ requires an explicit export flag. A system broadcast (power saver)
+        // is delivered regardless, so RECEIVER_NOT_EXPORTED is correct and safest.
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            context.registerReceiver(
+                receiver,
+                IntentFilterPowerSave,
+                android.content.Context.RECEIVER_NOT_EXPORTED,
+            )
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, IntentFilterPowerSave)
+        }
         onDispose { runCatching { context.unregisterReceiver(receiver) } }
     }
 }
