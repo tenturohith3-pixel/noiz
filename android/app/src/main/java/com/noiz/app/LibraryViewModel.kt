@@ -7,6 +7,9 @@ import androidx.lifecycle.viewModelScope
 import com.noiz.data.CatalogRepository
 import com.noiz.data.toDomain
 import com.noiz.datastore.SessionStore
+import com.noiz.model.Album
+import com.noiz.model.Artist
+import com.noiz.model.Playlist
 import com.noiz.model.Track
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
@@ -22,6 +25,9 @@ data class LibraryUiState(
     val loading: Boolean = true,
     val error: String? = null,
     val tracks: List<Track> = emptyList(),
+    val albums: List<Album> = emptyList(),
+    val artists: List<Artist> = emptyList(),
+    val playlists: List<Playlist> = emptyList(),
     val query: String = "",
     val serverUrl: String = "",
     val username: String = "",
@@ -51,35 +57,68 @@ class LibraryViewModel @Inject constructor(
         val sessionStore = SessionStore(application)
 
         viewModelScope.launch {
-            // Resolve the base URL before mapping tracks: artwork URLs are absolute and
-            // the image loader has no other way to know which server to dial.
+            // Resolve the base URL BEFORE any catalogue emission maps its artwork:
+            // artwork URLs are absolute and the image loader has no other way to know
+            // which server to dial. Collects below are infinite, so they live in
+            // nested launches started only after the session read completes.
             val session = runCatching { sessionStore.session.first() }.getOrNull()
             _state.value = _state.value.copy(
                 serverUrl = session?.serverUrl.orEmpty(),
                 username = session?.user?.username.orEmpty(),
             )
+            val serverUrl = session?.serverUrl
 
-            // An exception escaping this collector would take down the whole process
+            // An exception escaping any collector would take down the whole process
             // (unhandled coroutine exception): a single Room open failure must surface
             // as the error screen instead.
-            runCatching {
-                repository.tracks().collect { entities ->
-                    val tracks = entities.map { it.toDomain(serverUrl = session?.serverUrl) }
-                    allTracks.value = tracks
+            launch {
+                runCatching {
+                    repository.tracks().collect { entities ->
+                        val tracks = entities.map { it.toDomain(serverUrl = serverUrl) }
+                        allTracks.value = tracks
+                        _state.value = _state.value.copy(
+                            tracks = filter(tracks, _state.value.query),
+                            loading = false,
+                            // Cached rows are enough to play; a stale sync error must not hide
+                            // the library once Room has content.
+                            error = if (tracks.isEmpty()) _state.value.error else null,
+                        )
+                    }
+                }.onFailure { error ->
+                    Log.e(TAG, "library read failed", error)
                     _state.value = _state.value.copy(
-                        tracks = filter(tracks, _state.value.query),
                         loading = false,
-                        // Cached rows are enough to play; a stale sync error must not hide
-                        // the library once Room has content.
-                        error = if (tracks.isEmpty()) _state.value.error else null,
+                        error = error.message ?: "Could not read the library.",
                     )
                 }
-            }.onFailure { error ->
-                Log.e(TAG, "library read failed", error)
-                _state.value = _state.value.copy(
-                    loading = false,
-                    error = error.message ?: "Could not read the library.",
-                )
+            }
+
+            launch {
+                runCatching {
+                    repository.albums().collect { rows ->
+                        _state.value = _state.value.copy(
+                            albums = rows.map { it.toDomain(serverUrl = serverUrl) },
+                        )
+                    }
+                }.onFailure { Log.w(TAG, "albums read failed", it) }
+            }
+
+            launch {
+                runCatching {
+                    repository.artists().collect { rows ->
+                        _state.value = _state.value.copy(artists = rows.map { it.toDomain() })
+                    }
+                }.onFailure { Log.w(TAG, "artists read failed", it) }
+            }
+
+            launch {
+                runCatching {
+                    repository.playlists().collect { rows ->
+                        _state.value = _state.value.copy(
+                            playlists = rows.map { it.toDomain(serverUrl = serverUrl) },
+                        )
+                    }
+                }.onFailure { Log.w(TAG, "playlists read failed", it) }
             }
         }
 
@@ -92,6 +131,20 @@ class LibraryViewModel @Inject constructor(
             tracks = filter(allTracks.value, value),
         )
     }
+
+    /** Tracks of one album, in disc/track order, for album-card taps. */
+    fun tracksForAlbum(albumId: String): List<Track> =
+        allTracks.value.filter { it.albumId == albumId }
+
+    /** Tracks by one artist (name contains), for artist-card taps. */
+    fun tracksForArtist(artistName: String): List<Track> =
+        allTracks.value.filter { it.artistName.contains(artistName, ignoreCase = true) }
+
+    /** Tracks of a playlist, resolved from Room at tap time. */
+    suspend fun tracksForPlaylist(playlistId: String): List<Track> = runCatching {
+        repository.playlistTracks(playlistId).first()
+            .map { it.toDomain(serverUrl = _state.value.serverUrl) }
+    }.getOrDefault(emptyList())
 
     /**
      * Pulls any new catalog pages, then waits for Room to re-emit.

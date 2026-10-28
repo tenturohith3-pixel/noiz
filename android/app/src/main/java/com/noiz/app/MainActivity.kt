@@ -11,6 +11,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -20,6 +23,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -29,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -47,6 +52,7 @@ import com.noiz.designsystem.GlassTierController
 import com.noiz.designsystem.NoizPalette
 import com.noiz.designsystem.NoizTypography
 import com.noiz.designsystem.ProvideGlass
+import com.noiz.data.artworkUrl
 import com.noiz.home.HomeCard
 import com.noiz.home.HomeScreen
 import com.noiz.home.HomeShelf
@@ -57,9 +63,11 @@ import com.noiz.model.Track
 import com.noiz.playback.PlaybackService
 import com.noiz.playback.PlaybackStateBus
 import com.noiz.playback.PlaybackStatus
+import dagger.hilt.android.AndroidEntryPoint
 import dev.chrisbanes.haze.HazeState
 import kotlinx.coroutines.flow.first
 import androidx.hilt.navigation.compose.hiltViewModel
+import kotlinx.coroutines.launch
 
 /**
  * Root scaffold.
@@ -71,6 +79,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
  * It also never wrapped the tree in a `MaterialTheme`.
  */
 @UnstableApi
+@AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
     private val glassController by lazy { GlassTierController(applicationContext, lifecycleScope) }
@@ -152,6 +161,12 @@ private fun NoizApp(hazeState: HazeState) {
                 onRetry = viewModel::refresh,
                 onPlay = { track -> PlaybackBridge.play(context, track) },
                 onPlayAll = { tracks -> PlaybackBridge.playAll(context, tracks) },
+                onPlayPlaylist = { playlistId ->
+                    lifecycleScope.launch {
+                        val tracks = viewModel.tracksForPlaylist(playlistId)
+                        if (tracks.isNotEmpty()) PlaybackBridge.playAll(context, tracks)
+                    }
+                },
                 onPlayPause = { PlaybackBridge.send(context, PlaybackService.ACTION_TOGGLE_PLAY) },
                 onNext = { PlaybackBridge.send(context, PlaybackService.ACTION_NEXT) },
                 onSeek = { positionMs -> PlaybackBridge.seek(context, positionMs) },
@@ -165,9 +180,11 @@ private fun NoizApp(hazeState: HazeState) {
 /**
  * The library surface.
  *
- * Maps [LibraryUiState] and the process-wide [PlaybackStatus] onto the existing
- * [HomeScreen] contract so the glass UI, the mini-player and the Now Playing sheet all
- * show and control the same session the notification does.
+ * Maps [LibraryUiState] and the process-wide [PlaybackStatus] onto the [HomeScreen]
+ * contract so the glass UI, the mini-player and the Now Playing sheet all show and
+ * control the same session the notification does. Content is organised into
+ * Spotify-style shelves — Recently added / Albums / Artists / Playlists — filterable
+ * with the chip row under the search field.
  */
 @Composable
 private fun LibraryScreen(
@@ -178,6 +195,7 @@ private fun LibraryScreen(
     onRetry: () -> Unit,
     onPlay: (Track) -> Unit,
     onPlayAll: (List<Track>) -> Unit,
+    onPlayPlaylist: (String) -> Unit,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     onSeek: (Long) -> Unit,
@@ -188,33 +206,90 @@ private fun LibraryScreen(
     val emptyLabel = stringResource(R.string.connect_empty)
     val retryLabel = stringResource(R.string.connect_retry)
 
-    val artworkUrl = remember(state.tracks, playback.trackId) {
+    var tab by remember { mutableIntStateOf(0) }
+
+    val nowArtworkUrl = remember(state.tracks, playback.trackId) {
         state.tracks.firstOrNull { it.id == playback.trackId }?.artwork?.url
     }
     val positionEpochMs = remember(playback) { SystemClock.elapsedRealtime() }
 
-    val homeState = remember(state.tracks, state.query, playback, artworkUrl) {
-        val cards = state.tracks.map { track ->
-            HomeCard(
-                id = track.id,
-                title = track.title,
-                subtitle = track.artistName,
-                artworkUrl = track.artwork.url,
-            )
+    val shelves = remember(state, tab) {
+        buildList {
+            if (tab == 0 || tab == 1) {
+                add(
+                    HomeShelf(
+                        id = "tracks",
+                        title = "Recently added",
+                        cards = state.tracks.take(30).map { t ->
+                            HomeCard(
+                                id = t.id,
+                                title = t.title,
+                                subtitle = t.artistName,
+                                artworkUrl = t.artwork.url,
+                            )
+                        },
+                    ),
+                )
+            }
+            if (tab == 0 || tab == 2) {
+                add(
+                    HomeShelf(
+                        id = "albums",
+                        title = "Albums",
+                        cards = state.albums.map { album ->
+                            HomeCard(
+                                id = "album:${album.id}",
+                                title = album.title,
+                                subtitle = album.artistName,
+                                artworkUrl = album.artwork.url,
+                            )
+                        },
+                    ),
+                )
+            }
+            if (tab == 0 || tab == 3) {
+                add(
+                    HomeShelf(
+                        id = "artists",
+                        title = "Artists",
+                        cards = state.artists.map { artist ->
+                            HomeCard(
+                                id = "artist:${artist.id}",
+                                title = artist.name,
+                                subtitle = null,
+                                artworkUrl = artworkUrl(artist.imageHash, state.serverUrl),
+                            )
+                        },
+                    ),
+                )
+            }
+            if (tab == 0 || tab == 4) {
+                add(
+                    HomeShelf(
+                        id = "playlists",
+                        title = "Playlists",
+                        cards = state.playlists.map { playlist ->
+                            HomeCard(
+                                id = "playlist:${playlist.id}",
+                                title = playlist.name,
+                                subtitle = playlist.description,
+                                artworkUrl = playlist.artwork.url,
+                            )
+                        },
+                    ),
+                )
+            }
         }
+    }
+
+    val homeState = remember(shelves, playback, nowArtworkUrl, state.query) {
         HomeUiState(
-            shelves = listOf(
-                HomeShelf(
-                    id = "library",
-                    title = "Library",
-                    cards = cards,
-                ),
-            ),
+            shelves = shelves,
             nowPlaying = NowPlayingUiState(
                 title = playback.title,
                 artist = playback.artist,
                 album = playback.album,
-                artworkUrl = artworkUrl,
+                artworkUrl = nowArtworkUrl,
                 isPlaying = playback.isPlaying,
                 durationMs = playback.durationMs,
                 positionMs = {
@@ -233,6 +308,8 @@ private fun LibraryScreen(
         )
     }
 
+    val hasContent = shelves.any { it.cards.isNotEmpty() }
+
     Column(Modifier.fillMaxSize()) {
         OutlinedTextField(
             value = state.query,
@@ -246,12 +323,32 @@ private fun LibraryScreen(
         )
         Spacer(Modifier.height(8.dp))
 
+        // Library filter chips — Spotify's Home/Search/Library split lives here as a
+        // single scrollable chip row so the sheet, mini-player and backdrop stay put.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            listOf("All", "Tracks", "Albums", "Artists", "Playlists")
+                .forEachIndexed { index, label ->
+                    FilterChip(
+                        selected = tab == index,
+                        onClick = { tab = index },
+                        label = { Text(label) },
+                    )
+                }
+        }
+        Spacer(Modifier.height(4.dp))
+
         when {
             state.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
             }
 
-            state.error != null -> Box(
+            state.error != null && !hasContent -> Box(
                 Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
             ) {
@@ -262,7 +359,7 @@ private fun LibraryScreen(
                 }
             }
 
-            state.tracks.isEmpty() -> Box(
+            !hasContent -> Box(
                 Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
             ) { Text(emptyLabel, style = NoizTypography.bodyMedium) }
@@ -276,12 +373,34 @@ private fun LibraryScreen(
                 onShuffle = onShuffle,
                 onRepeat = onRepeat,
                 onCardClick = { card ->
-                    state.tracks.firstOrNull { it.id == card.id }?.let(onPlay)
+                    when {
+                        card.id.startsWith("album:") -> {
+                            val tracks = albumTracksFrom(state, card.id.removePrefix("album:"))
+                            if (tracks.isNotEmpty()) onPlayAll(tracks)
+                        }
+                        card.id.startsWith("artist:") -> {
+                            val tracks = artistTracksFrom(state, card.subtitle.orEmpty())
+                            if (tracks.isNotEmpty()) onPlayAll(tracks)
+                        }
+                        card.id.startsWith("playlist:") ->
+                            onPlayPlaylist(card.id.removePrefix("playlist:"))
+                        else -> state.tracks.firstOrNull { it.id == card.id }?.let(onPlay)
+                    }
                 },
             )
         }
     }
 }
+
+/**
+ * Local shelf-tap helpers: the album/artist queues are resolved from the loaded track
+ * list, so a tap needs no network round-trip.
+ */
+private fun albumTracksFrom(state: LibraryUiState, albumId: String): List<Track> =
+    state.tracks.filter { it.albumId == albumId }
+
+private fun artistTracksFrom(state: LibraryUiState, artistName: String): List<Track> =
+    state.tracks.filter { it.artistName.contains(artistName, ignoreCase = true) }
 
 private fun Int.toRepeatMode(): RepeatMode = when (this) {
     androidx.media3.common.Player.REPEAT_MODE_ONE -> RepeatMode.ONE

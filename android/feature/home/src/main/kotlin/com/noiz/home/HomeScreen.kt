@@ -31,9 +31,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -251,22 +253,20 @@ private fun BoxScope.HomeFeed(
             )
         }
 
-        state.shelves.forEach { shelf ->
-            item(key = shelf.id, contentType = "shelf-header") {
-                Text(
-                    text = shelf.title,
-                    style = NoizTypography.titleLarge,
-                    modifier = Modifier.semantics { heading() },
-                )
+        state.shelves
+            .filter { it.cards.isNotEmpty() }
+            .forEach { shelf ->
+                item(key = "${shelf.id}-header", contentType = "shelf-header") {
+                    Text(
+                        text = shelf.title,
+                        style = NoizTypography.titleLarge,
+                        modifier = Modifier.semantics { heading() },
+                    )
+                }
+                item(key = "${shelf.id}-rail", contentType = "shelf-rail") {
+                    ShelfRail(shelf = shelf, hazeState = hazeState, onClick = onCardClick)
+                }
             }
-            items(
-                items = shelf.cards,
-                key = { "${shelf.id}:${it.id}" },
-                contentType = { CONTENT_TYPE_CARD },
-            ) { card ->
-                HomeCardRow(card = card, hazeState = hazeState, onClick = onCardClick)
-            }
-        }
     }
 
     // G2 top bar — blur only while content scrolls beneath it (frame rule #5).
@@ -289,66 +289,64 @@ private fun BoxScope.HomeFeed(
 
 
 /**
- * A single catalogue card.
+ * A horizontal Spotify-style rail of catalogue cards.
  *
- * §13 requires every interactive control to expose a content description and a role;
- * the previous version had neither, so TalkBack announced an unlabelled, inert box.
- * The card is a `selectable` button because tapping it starts playback (§3.2).
+ * Cover-art-first tiles (like Spotify's album/artist shelves) sitting directly on the
+ * ambient glass backdrop, so the blur is the card surface — no extra panel per tile.
+ * §13 requires a content description and a role; the tile is a `selectable` button
+ * because tapping it starts playback (§3.2).
  */
 @Composable
-private fun HomeCardRow(
-    card: HomeCard,
+private fun ShelfRail(
+    shelf: HomeShelf,
     hazeState: HazeState,
     onClick: (HomeCard) -> Unit,
 ) {
-    val artworkDescription = if (card.title.isNotBlank()) {
-        stringResource(R.string.cd_artwork_for, card.title)
-    } else {
-        stringResource(R.string.cd_artwork_generic)
-    }
-
-    GlassSurface(
-        hazeState = hazeState,
-        level = GlassLevel.G1,
-        shape = RoundedCornerShape(20.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .selectable(
-                selected = false,
-                role = Role.Button,
-                onClick = { onClick(card) },
-            )
-            .semantics(mergeDescendants = true) {
-                contentDescription = listOfNotNull(card.title, card.subtitle)
-                    .joinToString(", ")
-            },
+    LazyRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        contentPadding = PaddingValues(horizontal = 4.dp),
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            ArtworkPlaceholder(
-                url = card.artworkUrl,
-                modifier = Modifier.size(56.dp),
-                cornerRadius = 14.dp,
-                label = artworkDescription,
-            )
-            Column(Modifier.weight(1f)) {
+        items(items = shelf.cards, key = { it.id }, contentType = { CONTENT_TYPE_CARD }) { card ->
+            val artworkDescription = if (card.title.isNotBlank()) {
+                stringResource(R.string.cd_artwork_for, card.title)
+            } else {
+                stringResource(R.string.cd_artwork_generic)
+            }
+
+            Column(
+                modifier = Modifier
+                    .width(148.dp)
+                    .selectable(
+                        selected = false,
+                        role = Role.Button,
+                        onClick = { onClick(card) },
+                    )
+                    .semantics(mergeDescendants = true) {
+                        contentDescription = listOfNotNull(card.title, card.subtitle)
+                            .joinToString(", ")
+                    },
+            ) {
+                ArtworkPlaceholder(
+                    url = card.artworkUrl,
+                    modifier = Modifier.size(148.dp),
+                    cornerRadius = 14.dp,
+                    label = artworkDescription,
+                )
+                Spacer(Modifier.height(6.dp))
                 Text(
                     card.title,
-                    style = NoizTypography.titleLarge,
+                    style = NoizTypography.bodyMedium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
                 card.subtitle?.let {
                     Text(
                         it,
-                        style = NoizTypography.bodyMedium,
+                        style = NoizTypography.labelSmall,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
+                        color = LocalNoizPalette.current.onSurfaceVariant,
                     )
                 }
             }
