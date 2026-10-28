@@ -73,7 +73,10 @@ class PlaybackService : MediaLibraryService() {
         settings = PlaybackComponents.settingsFactory(this)
 
         // User settings must reach the engine or crossfade/normalization never apply.
-        applySettings(settings)
+        // The initial read blocks on DataStore; a corrupt settings file must leave the
+        // engine on defaults instead of crashing the service (and with it the app).
+        runCatching { applySettings(settings) }
+            .onFailure { android.util.Log.e("PlaybackService", "initial settings failed", it) }
         observeSettings()
 
         player = NoizPlayer(engine, serviceScope)
@@ -227,7 +230,10 @@ class PlaybackService : MediaLibraryService() {
     private fun observeSettings() {
         val changes = settings.changes ?: return
         serviceScope.launch {
-            changes.collect { applySettings(it) }
+            // A corrupt settings DataStore must disable live reconfiguration, not kill
+            // the service (a crashed service takes the whole app process with it).
+            runCatching { changes.collect { applySettings(it) } }
+                .onFailure { android.util.Log.e("PlaybackService", "settings stream failed", it) }
         }
     }
 

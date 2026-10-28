@@ -70,6 +70,19 @@
             </intent-filter>
         </activity>
 
+        <!-- WorkManager: on-demand initialization via Configuration.Provider on the
+             Application. Without removing this node, WorkManager initializes eagerly
+             with a default factory and the @HiltWorker classes never get theirs. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
         <!-- PlaybackService: MediaLibrarySession host. Type declaration is required on 14+ -->
         <service
             android:name="com.noiz.playback.PlaybackService"

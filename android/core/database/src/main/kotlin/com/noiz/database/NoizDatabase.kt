@@ -41,7 +41,10 @@ class Converters {
         PaletteCacheEntity::class,
         SearchIndexEntity::class,
     ],
-    version = 1,
+    // Version 2: bumped so an install from any older build (whose version-1 schema may
+    // differ on disk) can never hit Room's "cannot verify the data integrity" crash
+    // loop — the destructive fallback below recreates the schema instead.
+    version = 2,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -106,7 +109,11 @@ abstract class NoizDatabase : RoomDatabase() {
                     }
                 })
                 // Downloads and outbox ops must survive a failed migration attempt.
-                .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
+                // Destructive fallback in BOTH directions: a version skew between
+                // installed builds used to crash Room at open with "Migration didn't
+                // handle" / "cannot verify the data integrity", which bricked every
+                // launch. The catalog re-syncs from the server, so wiping is safe.
+                .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
 
         /**

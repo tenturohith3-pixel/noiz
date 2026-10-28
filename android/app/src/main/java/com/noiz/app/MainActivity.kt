@@ -123,7 +123,11 @@ private fun NoizApp(hazeState: HazeState) {
     var signedIn by remember { mutableStateOf<Boolean?>(null) }
 
     LaunchedEffect(Unit) {
-        val session = com.noiz.datastore.SessionStore(context).session.first()
+        // A corrupt DataStore file must degrade to the sign-in screen, not a crash
+        // loop: this read used to be uncaught, so every launch died before rendering.
+        val session = runCatching {
+            com.noiz.datastore.SessionStore(context).session.first()
+        }.getOrNull()
         signedIn = session != null && session.accessToken.isNotBlank()
         if (signedIn == true) viewModel.refresh()
     }

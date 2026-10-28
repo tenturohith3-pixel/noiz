@@ -115,10 +115,13 @@ object AppGraph {
         }
 
         // Streaming cache: LRU-bounded, safe to evict at any time (§11 row 11).
-        val streamCache = SimpleCache(
-            File(app.cacheDir, "noiz_stream"),
-            LeastRecentlyUsedCacheEvictor(STREAM_CACHE_BYTES),
-            StandaloneDatabaseProvider(app),
+        // A previous process killed mid-write can leave the Media3 cache database
+        // corrupt; that used to crash every subsequent launch until the folder was
+        // cleared by hand. Detect the failure, wipe the folder, retry once.
+        val streamCache = buildCache(
+            folder = File(app.cacheDir, "noiz_stream"),
+            evictor = LeastRecentlyUsedCacheEvictor(STREAM_CACHE_BYTES),
+            app = app,
         )
 
         // Downloads get their OWN cache with a no-op evictor. Sharing the streaming
@@ -126,10 +129,10 @@ object AppGraph {
         // would happily delete a user's completed offline downloads — Media3's own
         // DownloadManager docs require "a CacheEvictor that will not evict downloaded
         // content". It also lets us bound the cache independently.
-        val downloadCache = SimpleCache(
-            File(app.filesDir, "noiz_downloads_cache"),
-            NoOpCacheEvictor(),
-            StandaloneDatabaseProvider(app),
+        val downloadCache = buildCache(
+            folder = File(app.filesDir, "noiz_downloads_cache"),
+            evictor = NoOpCacheEvictor(),
+            app = app,
         )
 
         val streamTokens = InMemoryTokenStore()
@@ -197,6 +200,18 @@ object AppGraph {
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ||
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
+
+    /**
+     * Builds a [SimpleCache] over [folder], wiping it once and retrying if the
+     * Media3 metadata database inside is corrupt (the classic post-crash loop).
+     */
+    private fun buildCache(folder: File, evictor: androidx.media3.datasource.cache.CacheEvictor, app: Application): SimpleCache =
+        runCatching { SimpleCache(folder, evictor, StandaloneDatabaseProvider(app)) }
+            .getOrElse { failure ->
+                android.util.Log.e("AppGraph", "cache at ${folder.path} corrupt; wiping", failure)
+                folder.deleteRecursively()
+                SimpleCache(folder, evictor, StandaloneDatabaseProvider(app))
+            }
 
     // -----------------------------------------------------------------------
     // Small adapters

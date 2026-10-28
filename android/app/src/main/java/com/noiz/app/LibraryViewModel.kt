@@ -59,15 +59,26 @@ class LibraryViewModel @Inject constructor(
                 username = session?.user?.username.orEmpty(),
             )
 
-            repository.tracks().collect { entities ->
-                val tracks = entities.map { it.toDomain(serverUrl = session?.serverUrl) }
-                allTracks.value = tracks
+            // An exception escaping this collector would take down the whole process
+            // (unhandled coroutine exception): a single Room open failure must surface
+            // as the error screen instead.
+            runCatching {
+                repository.tracks().collect { entities ->
+                    val tracks = entities.map { it.toDomain(serverUrl = session?.serverUrl) }
+                    allTracks.value = tracks
+                    _state.value = _state.value.copy(
+                        tracks = filter(tracks, _state.value.query),
+                        loading = false,
+                        // Cached rows are enough to play; a stale sync error must not hide
+                        // the library once Room has content.
+                        error = if (tracks.isEmpty()) _state.value.error else null,
+                    )
+                }
+            }.onFailure { error ->
+                Log.e(TAG, "library read failed", error)
                 _state.value = _state.value.copy(
-                    tracks = filter(tracks, _state.value.query),
                     loading = false,
-                    // Cached rows are enough to play; a stale sync error must not hide
-                    // the library once Room has content.
-                    error = if (tracks.isEmpty()) _state.value.error else null,
+                    error = error.message ?: "Could not read the library.",
                 )
             }
         }

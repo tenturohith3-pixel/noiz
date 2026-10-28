@@ -38,6 +38,8 @@ class NoizApplication : Application(), Configuration.Provider {
 
     override fun onCreate() {
         super.onCreate()
+        // Must be the very first thing: it catches failures in the wiring below too.
+        CrashReporter.install(this)
         AppGraph.install(this, catalog, historyLogger)
     }
 }
