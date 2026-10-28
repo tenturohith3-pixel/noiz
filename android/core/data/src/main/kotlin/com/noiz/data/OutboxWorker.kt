@@ -50,13 +50,18 @@ data class OutboxBatchResponse(val results: List<OutboxOpResultDto> = emptyList(
 @Serializable
 data class PlayEventDto(
     val id: String,
-    @SerialName("track_id") val trackId: String,
-    @SerialName("started_at") val startedAt: String,
-    @SerialName("played_ms") val playedMs: Int,
-    @SerialName("ended_reason") val endedReason: String,
+    val trackId: String,
+    val startedAt: String,
+    /** Required by the server; "play" is the only event kind the client emits. */
+    val eventType: String = "play",
+    val playedMs: Int,
+    val positionMs: Int? = null,
+    val endedReason: String,
     val rendition: String? = null,
     val offline: Boolean = false,
     val private: Boolean = false,
+    /** Stable per local row, so a retried upload is deduplicated server-side. */
+    val idempotencyKey: String,
 )
 
 @Serializable
@@ -175,6 +180,7 @@ class OutboxWorker @AssistedInject constructor(
                         rendition = event.rendition,
                         offline = event.offline,
                         private = event.private,
+                        idempotencyKey = event.id,
                     )
                 },
             ),

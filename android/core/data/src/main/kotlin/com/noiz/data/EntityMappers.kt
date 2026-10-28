@@ -37,8 +37,8 @@ fun TrackDto.toEntity(): TrackEntity = TrackEntity(
     durationMs = durationMs,
     explicit = explicit,
     isrc = isrc,
-    loudnessLufs = loudnessLufs,
-    truePeakDb = truePeakDb,
+    loudnessLufs = loudness.trackLufs,
+    truePeakDb = loudness.trackPeakDb,
     gaplessNext = gaplessNext,
     hasLyrics = hasLyrics,
     hasCanvas = hasCanvas,
@@ -83,7 +83,10 @@ fun PlaylistDto.toEntity(): PlaylistEntity = PlaylistEntity(
 // Room → domain, for the UI
 // ------------------------------------------------------------------------------
 
-fun TrackEntity.toDomain(renditions: List<com.noiz.model.Rendition> = emptyList()): Track = Track(
+fun TrackEntity.toDomain(
+    renditions: List<com.noiz.model.Rendition> = emptyList(),
+    serverUrl: String? = null,
+): Track = Track(
     id = id,
     title = title,
     albumId = albumId,
@@ -99,20 +102,20 @@ fun TrackEntity.toDomain(renditions: List<com.noiz.model.Rendition> = emptyList(
     gaplessNext = gaplessNext,
     hasLyrics = hasLyrics,
     hasCanvas = hasCanvas,
-    artwork = com.noiz.model.Artwork(hash = artworkHash, url = artworkUrl(artworkHash)),
+    artwork = com.noiz.model.Artwork(hash = artworkHash, url = artworkUrl(artworkHash, serverUrl)),
     renditions = renditions,
     addedAt = addedAt,
     updatedAt = updatedAt,
 )
 
-fun AlbumEntity.toDomain(): Album = Album(
+fun AlbumEntity.toDomain(serverUrl: String? = null): Album = Album(
     id = id,
     title = title,
     artistName = artistName,
     albumType = albumType,
     releaseYear = releaseYear,
     trackCount = trackCount,
-    artwork = com.noiz.model.Artwork(hash = artworkHash, url = artworkUrl(artworkHash)),
+    artwork = com.noiz.model.Artwork(hash = artworkHash, url = artworkUrl(artworkHash, serverUrl)),
     dominantHex = dominantHex,
     vibrantHex = vibrantHex,
     mutedHex = mutedHex,
@@ -127,17 +130,24 @@ fun ArtistEntity.toDomain(): Artist = Artist(
     updatedAt = updatedAt,
 )
 
-fun PlaylistEntity.toDomain(trackCount: Int = 0): Playlist = Playlist(
+fun PlaylistEntity.toDomain(trackCount: Int = 0, serverUrl: String? = null): Playlist = Playlist(
     id = id,
     ownerId = ownerId,
     name = name,
     description = description,
     isCollaborative = isCollaborative,
-    artwork = com.noiz.model.Artwork(hash = artworkHash, url = artworkUrl(artworkHash)),
+    artwork = com.noiz.model.Artwork(hash = artworkHash, url = artworkUrl(artworkHash, serverUrl)),
     trackCount = trackCount,
     updatedAt = updatedAt,
 )
 
-/** Artwork is content-addressed and cacheable-immutable (§5.3). */
-fun artworkUrl(hash: String?): String? =
-    hash?.let { "/api/v1/artwork/${it.removePrefix("sha256:")}" }
+/**
+ * Artwork is content-addressed and cacheable-immutable (§5.3).
+ *
+ * The server serves it at `/artwork/{hash}`. Callers that render it (Coil, the
+ * notification) need an absolute URL, so pass the signed-in server's base URL.
+ */
+fun artworkUrl(hash: String?, serverUrl: String? = null): String? {
+    val path = hash?.let { "/artwork/${it.removePrefix("sha256:")}" } ?: return null
+    return if (serverUrl.isNullOrBlank()) path else serverUrl.trimEnd('/') + path
+}

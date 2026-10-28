@@ -6,6 +6,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
@@ -33,10 +34,6 @@ import kotlinx.coroutines.launch
  * [MediaLibrarySession] bound to a [NoizPlayer] facade. The notification, the in-app
  * UI, Bluetooth and Android Auto therefore all observe the same snapshot and can never
  * disagree about what is playing (§8.3).
- *
- * The previous implementation built a bare `ExoPlayer` and ignored the engine entirely,
- * so normalization, crossfade, caching, signed-URL resolution and queue persistence
- * were all dead code.
  */
 @UnstableApi
 class PlaybackService : MediaLibraryService() {
@@ -45,15 +42,22 @@ class PlaybackService : MediaLibraryService() {
 
     private lateinit var engine: DualPlayerEngine
     private lateinit var player: NoizPlayer
+    private lateinit var history: PlaybackHistory
     private var librarySession: MediaLibrarySession? = null
 
     private lateinit var restoreStore: QueueRestoreStore
     private lateinit var browseTree: BrowseTreeProvider
     private lateinit var favorites: FavoritesWriter
     private lateinit var settings: PlaybackSettings
+    private var currentSettings: PlaybackSettings = PlaybackSettingsSnapshot()
 
     private var sleepTimer: SleepTimerController? = null
     private var persistJob: Job? = null
+
+    /** Id of the play event currently being accumulated, or null when not playing. */
+    private var activeEventId: String? = null
+    private var activeTrackId: String? = null
+    private var lastPlayedMs: Long = 0L
 
     /** Wall-clock at which playback ended and the service may stop itself (§8.3). */
     private var idleSinceMs: Long = 0L
@@ -65,12 +69,12 @@ class PlaybackService : MediaLibraryService() {
         restoreStore = PlaybackComponents.restoreStoreFactory(this)
         browseTree = PlaybackComponents.browseTreeFactory(this)
         favorites = PlaybackComponents.favoritesFactory(this)
+        history = PlaybackComponents.historyFactory(this)
         settings = PlaybackComponents.settingsFactory(this)
 
         // User settings must reach the engine or crossfade/normalization never apply.
-        engine.setCrossfadeMs(settings.crossfadeMs)
-        engine.normalizationTargetLufs = settings.normalizationTargetLufs
-        engine.setVolume(settings.outputVolume)
+        applySettings(settings)
+        observeSettings()
 
         player = NoizPlayer(engine, serviceScope)
         sleepTimer = SleepTimerController(engine, serviceScope)
@@ -83,18 +87,46 @@ class PlaybackService : MediaLibraryService() {
 
         startPositionPersistence()
         startIdleWatchdog()
+        startStatePublisher()
+        startHistoryTracking()
     }
 
     override fun onGetSession(
         controller: MediaSession.ControllerInfo,
     ): MediaLibrarySession = librarySession
-            ?: error("onGetSession called before onCreate finished")
+        ?: error("onGetSession called before onCreate finished")
 
     // -----------------------------------------------------------------------
     // Browse tree + custom commands (§3.6, §8.3)
     // -----------------------------------------------------------------------
 
     private val libraryCallback = object : MediaLibrarySession.Callback {
+
+        override fun onConnect(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): MediaSession.ConnectionResult =
+            MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailableSessionCommands(
+                    if (isTrustedSystem(controller)) {
+                        MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
+                    } else {
+                        // Untrusted callers may control transport and read the timeline,
+                        // but may not replace the queue or read the whole catalogue.
+                        MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS
+                    },
+                )
+                .build()
+
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle,
+        ): ListenableFuture<SessionResult> {
+            dispatchSessionCommand(customCommand, args)
+            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+        }
 
         override fun onGetLibraryRoot(
             session: MediaLibrarySession,
@@ -145,47 +177,12 @@ class PlaybackService : MediaLibraryService() {
         ): ListenableFuture<LibraryResult<Void>> {
             // Routed through the provider so the query is escaped before it reaches FTS;
             // raw user input raised SQLiteException on any operator character.
-            runCatching { browseTree.searchBlocking(query) }
+            val results = runCatching { browseTree.searchBlocking(query) }.getOrDefault(emptyList())
+            // Without this notification Android Auto showed an empty search forever:
+            // the results were computed and then discarded.
+            session.notifySearchResultChanged(controller, query, results.size, params)
             return Futures.immediateFuture(LibraryResult.ofVoid())
         }
-    }
-
-    /**
-     * Transport-level callbacks.
-     *
-     * In Media3 1.5.1 `MediaLibrarySession.Builder.setCallback` is package-private, so
-     * these cannot be attached to the library session. `onCustomCommand` and the
-     * controller authorization therefore live on a plain [MediaSession.Callback] that
-     * `NoizPlayer` exposes via [MediaSessionConnector]-free direct dispatch instead —
-     * see [dispatchSessionCommand] / [isTrustedSystem].
-     */
-    private val sessionCallback = object : MediaSession.Callback {
-
-        override fun onCustomCommand(
-            session: MediaSession,
-            controller: MediaSession.ControllerInfo,
-            customCommand: SessionCommand,
-            args: Bundle,
-        ): ListenableFuture<SessionResult> {
-            dispatchSessionCommand(customCommand, args)
-            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
-        }
-
-        override fun onConnect(
-            session: MediaSession,
-            controller: MediaSession.ControllerInfo,
-        ): MediaSession.ConnectionResult =
-            MediaSession.ConnectionResult.AcceptedResultBuilder(session)
-                .setAvailableSessionCommands(
-                    if (isTrustedSystem(controller)) {
-                        MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
-                    } else {
-                        // Untrusted callers may control transport and read the timeline,
-                        // but may not replace the queue or read the whole catalogue.
-                        MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS
-                    },
-                )
-                .build()
     }
 
     /** Routes a custom session command to the engine / Room. */
@@ -201,6 +198,7 @@ class PlaybackService : MediaLibraryService() {
                     engine.publishCommandResult(customCommand.customAction)
                 }
         }
+        publishPlaybackStatus()
     }
 
     private fun isTrustedSystem(controller: MediaSession.ControllerInfo): Boolean =
@@ -210,15 +208,122 @@ class PlaybackService : MediaLibraryService() {
     private fun pendingIntentToNowPlaying(): PendingIntent {
         val intent = packageManager.getLaunchIntentForPackage(packageName)
             ?: Intent(Intent.ACTION_MAIN).setPackage(packageName)
-        // FLAG_IMMUTABLE was added in API 23; minSdk is 29 so this is always safe, but
-        // building it conditionally documents why the constant is legal here.
-        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                PendingIntent.FLAG_IMMUTABLE
-            } else {
-                0
-            }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         return PendingIntent.getActivity(this, 0, intent, flags)
+    }
+
+    // -----------------------------------------------------------------------
+    // Settings + state publishing
+    // -----------------------------------------------------------------------
+
+    private fun applySettings(value: PlaybackSettings) {
+        currentSettings = value
+        engine.setCrossfadeMs(value.crossfadeMs)
+        engine.normalizationTargetLufs = value.normalizationTargetLufs
+        engine.setVolume(value.outputVolume)
+    }
+
+    /** Applies settings changed while the service is alive (crossfade, volume, ...). */
+    private fun observeSettings() {
+        val changes = settings.changes ?: return
+        serviceScope.launch {
+            changes.collect { applySettings(it) }
+        }
+    }
+
+    /**
+     * Pushes a snapshot to [PlaybackStateBus] twice a second.
+     *
+     * The engine only publishes on player events, so in gapless mode the position would
+     * otherwise stay frozen between tracks; the UI reads this state for its seek bar.
+     */
+    private fun startStatePublisher() {
+        serviceScope.launch {
+            while (isActive) {
+                publishPlaybackStatus()
+                delay(UI_POSITION_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun publishPlaybackStatus() {
+        val snapshot = engine.snapshot.value
+        val track = snapshot.queue.getOrNull(snapshot.currentIndex)
+        val metadata = track?.mediaItem?.mediaMetadata
+        val position = runCatching { engine.currentPlayer().currentPosition }
+            .getOrDefault(snapshot.positionMs)
+            .coerceAtLeast(0L)
+        val duration = when {
+            snapshot.durationMs > 0L -> snapshot.durationMs
+            track != null && track.durationMs > 0L -> track.durationMs
+            else -> 0L
+        }
+        val hasNext = when {
+            snapshot.queue.size <= 1 -> false
+            snapshot.repeatMode != Player.REPEAT_MODE_OFF -> true
+            else -> snapshot.currentIndex < snapshot.queue.lastIndex
+        }
+
+        PlaybackStateBus.publish(
+            PlaybackStatus(
+                trackId = track?.mediaItem?.mediaId,
+                title = metadata?.title?.toString().orEmpty(),
+                artist = metadata?.artist?.toString().orEmpty(),
+                album = metadata?.albumTitle?.toString().orEmpty(),
+                durationMs = duration,
+                positionMs = position,
+                bufferedPositionMs = snapshot.bufferedPositionMs,
+                isPlaying = snapshot.isPlaying,
+                canPlay = track != null,
+                hasNext = hasNext,
+                repeatMode = snapshot.repeatMode,
+                shuffleEnabled = snapshot.shuffleModeEnabled,
+                errorMessage = snapshot.error?.message,
+            ),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Play history (§6.6)
+    // -----------------------------------------------------------------------
+
+    private fun startHistoryTracking() {
+        serviceScope.launch {
+            engine.snapshot.collect { snapshot -> trackHistory(snapshot) }
+        }
+    }
+
+    private fun trackHistory(snapshot: EngineSnapshot) {
+        val track = snapshot.queue.getOrNull(snapshot.currentIndex)
+        val trackId = track?.mediaItem?.mediaId
+
+        if (snapshot.playbackState == Player.STATE_ENDED && activeEventId != null) {
+            finishEvent("completed", maxOf(lastPlayedMs, snapshot.durationMs))
+        }
+
+        val playing = snapshot.playWhenReady &&
+            snapshot.playbackState != Player.STATE_ENDED &&
+            trackId != null
+
+        if (playing) {
+            if (trackId != activeTrackId) {
+                finishEvent(if (lastPlayedMs > 0L) "skip" else "start", lastPlayedMs)
+                activeEventId = history.start(trackId, track.renditionId, currentSettings.privateHistory)
+                activeTrackId = trackId
+                lastPlayedMs = 0L
+            }
+            lastPlayedMs = maxOf(lastPlayedMs, snapshot.positionMs)
+        } else if (trackId == null) {
+            finishEvent("stop", lastPlayedMs)
+        }
+    }
+
+    private fun finishEvent(reason: String, playedMs: Long) {
+        val id = activeEventId ?: return
+        history.end(id, reason, playedMs.toInt().coerceAtLeast(0))
+        activeEventId = null
+        activeTrackId = null
+        lastPlayedMs = 0L
     }
 
     // -----------------------------------------------------------------------
@@ -259,15 +364,9 @@ class PlaybackService : MediaLibraryService() {
         }.getOrNull() ?: return
         if (resolved.isEmpty()) return
 
+        val tracks = resolved.map { it.toEngineTrack() }
         engine.setQueue(
-            resolved.map { item ->
-                EngineTrack(
-                    mediaItem = item,
-                    renditionId = restored.renditionIds.getOrNull(resolved.indexOf(item))
-                        ?: EngineTrack.DEFAULT_RENDITION,
-                    durationMs = item.mediaMetadata.extras?.getLong(EXTRA_DURATION_MS) ?: 0L,
-                )
-            },
+            tracks,
             startIndex = restored.index,
             startPositionMs = restored.positionMs,
         )
@@ -302,6 +401,7 @@ class PlaybackService : MediaLibraryService() {
     override fun onDestroy() {
         persistJob?.cancel()
         persistNow()
+        finishEvent("interrupted", lastPlayedMs)
         librarySession?.release()
         librarySession = null
         player.release()
@@ -312,26 +412,44 @@ class PlaybackService : MediaLibraryService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // The Library screen starts the service with an explicit queue; the MediaSession
         // then owns it for the notification, Bluetooth and Android Auto.
-        if (intent?.action == ACTION_PLAY) {
-            val ids = intent.getStringArrayListExtra(EXTRA_TRACK_IDS).orEmpty()
-            val startIndex = intent.getIntExtra(EXTRA_START_INDEX, 0)
-            if (ids.isNotEmpty()) {
-                val resolved = runCatching { browseTree.resolveBlocking(ids) }.getOrNull().orEmpty()
-                if (resolved.isNotEmpty()) {
-                    engine.setQueue(
-                        resolved.map { item ->
-                            EngineTrack(
-                                mediaItem = item,
-                                renditionId = EngineTrack.DEFAULT_RENDITION,
-                                durationMs = item.mediaMetadata.extras?.getLong(EXTRA_DURATION_MS) ?: 0L,
-                            )
-                        },
-                        startIndex.coerceIn(0, resolved.lastIndex),
-                    )
-                    engine.play()
+        when (intent?.action) {
+            ACTION_PLAY -> {
+                val ids = intent.getStringArrayListExtra(EXTRA_TRACK_IDS).orEmpty()
+                val startIndex = intent.getIntExtra(EXTRA_START_INDEX, 0)
+                if (ids.isNotEmpty()) {
+                    // Resolves from Room in the caller's order; byIds() is unordered,
+                    // which used to scramble a queue that was requested in album order.
+                    val resolved = runCatching { browseTree.resolveBlocking(ids) }
+                        .getOrNull()
+                        .orEmpty()
+                    if (resolved.isNotEmpty()) {
+                        engine.setQueue(
+                            resolved.map { it.toEngineTrack() },
+                            startIndex.coerceIn(0, resolved.lastIndex),
+                        )
+                        engine.play()
+                    }
                 }
             }
+
+            ACTION_TOGGLE_PLAY -> {
+                if (engine.snapshot.value.isPlaying) engine.pause() else engine.play()
+            }
+
+            ACTION_PAUSE -> engine.pause()
+            ACTION_NEXT -> engine.seekToNext()
+            ACTION_PREVIOUS -> engine.seekToPrevious()
+            ACTION_SEEK -> engine.seekTo(intent.getLongExtra(EXTRA_POSITION_MS, 0L))
+            ACTION_SHUFFLE -> engine.publishCommandResult(NoizCommands.ACTION_SHUFFLE)
+            ACTION_REPEAT -> engine.publishCommandResult(NoizCommands.ACTION_REPEAT)
+            ACTION_STOP -> {
+                engine.pause()
+                persistNow()
+                finishEvent("stop", lastPlayedMs)
+                stopSelf()
+            }
         }
+        publishPlaybackStatus()
         return super.onStartCommand(intent, flags, startId)
     }
 
@@ -339,12 +457,22 @@ class PlaybackService : MediaLibraryService() {
         private const val POSITION_PERSIST_INTERVAL_MS = 5_000L
         private const val IDLE_POLL_INTERVAL_MS = 2_000L
         private const val IDLE_TIMEOUT_MS = 60_000L
-        private const val EXTRA_DURATION_MS = "noiz.durationMs"
+        private const val UI_POSITION_INTERVAL_MS = 500L
 
         /** Start the service with a queue resolved from local track ids. */
         const val ACTION_PLAY = "com.noiz.playback.PLAY"
+        const val ACTION_TOGGLE_PLAY = "com.noiz.playback.TOGGLE_PLAY"
+        const val ACTION_PAUSE = "com.noiz.playback.PAUSE"
+        const val ACTION_NEXT = "com.noiz.playback.NEXT"
+        const val ACTION_PREVIOUS = "com.noiz.playback.PREVIOUS"
+        const val ACTION_SEEK = "com.noiz.playback.SEEK"
+        const val ACTION_SHUFFLE = "com.noiz.playback.SHUFFLE"
+        const val ACTION_REPEAT = "com.noiz.playback.REPEAT"
+        const val ACTION_STOP = "com.noiz.playback.STOP"
+
         const val EXTRA_TRACK_IDS = "track_ids"
         const val EXTRA_START_INDEX = "start_index"
+        const val EXTRA_POSITION_MS = "position_ms"
 
         /**
          * Controllers allowed full access to the session: the app itself plus the

@@ -43,9 +43,10 @@ USER noiz
 EXPOSE 8000
 
 # Probes /readyz rather than /healthz: /healthz never touches the database, so it
-# reports healthy while Postgres is down.
+# reports healthy while Postgres is down. /readyz deliberately returns 204 (No Content)
+# on success, so accepting only 200 marked a healthy API unhealthy forever.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).status==200 else 1)"
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).status in (200,204) else 1)"
 
 # --proxy-headers so nginx's X-Forwarded-For is honoured for client IPs.
 CMD ["uvicorn", "noiz.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]

@@ -74,19 +74,21 @@ def _installed_task_modules() -> list[str]:
     return found
 
 
-def _resolved_rate_limits() -> dict:
+def _resolved_rate_limits(app: Celery) -> dict:
     """Expand the RATE_LIMITS globs onto the tasks that are actually registered.
 
     Celery matches `task_annotations` by exact task name. Globbing is only supported by
     `task_routes`, so the previous glob dict was inert and every provider request went
     out unthrottled — the opposite of the "rate limits are respected" claim.
-    """
-    from celery.app.registry import tasks as _registry
 
+    Iterate the application's registry, not the task class: the old
+    `from celery.app.registry import tasks` imported a name that does not exist in
+    Celery 5.x and killed both worker and beat at startup.
+    """
     resolved: dict = {}
     for pattern, limit in RATE_LIMITS.items():
         prefix = pattern.rstrip("*")
-        for name in _registry:
+        for name in app.tasks:
             if name == pattern or name.startswith(prefix):
                 resolved[name] = {"rate_limit": limit}
     return resolved
@@ -109,7 +111,7 @@ def create_celery() -> Celery:
         # `task_annotations` is keyed by EXACT task name — glob patterns are a
         # `task_routes` feature only. Passing the globs silently applied nothing, so
         # every provider call ran unthrottled.
-        task_annotations=_resolved_rate_limits(),
+        task_annotations=_resolved_rate_limits(app),
         # Long media jobs: 10 minute wall-clock cap matches the ingest sandbox limit (§12).
         task_time_limit=600,
         task_soft_time_limit=540,
@@ -122,25 +124,12 @@ def create_celery() -> Celery:
         timezone="UTC",
         enable_utc=True,
         beat_schedule={
-            # Library delta sync / taste recompute (§5.3) runs nightly.
+            # The reco/enrich/scrobble stages are not implemented yet. Scheduling their
+            # task names made beat enqueue work that no worker could execute (and made
+            # beat noisy at startup), so only the stages that exist are scheduled.
             "recompute-taste-vectors": {
                 "task": "noiz.reco.tasks.recompute_all_taste",
                 "schedule": crontab(hour=3, minute=0),
-            },
-            # Recommend evaluation harness gate (§5.6) runs before the taste job lands.
-            "recommender-eval": {
-                "task": "noiz.reco.tasks.evaluate_recommender",
-                "schedule": crontab(hour=2, minute=30),
-            },
-            # New-from-your-artists polling (§5.4).
-            "poll-followed-artists": {
-                "task": "noiz.enrich.tasks.poll_followed_artists",
-                "schedule": crontab(hour=4, minute=0, day_of_week=5),
-            },
-            # Scrobble retry sweep; Last.fm rejects anything older than 14 days (§6.11).
-            "scrobble-retry-sweep": {
-                "task": "noiz.scrobble.tasks.retry_pending",
-                "schedule": crontab(minute="*/15"),
             },
             # WatchFolder settle-and-ingest for drops the inotify handler missed (§4.3).
             "inbox-sweep": {

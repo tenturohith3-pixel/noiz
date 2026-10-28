@@ -42,6 +42,9 @@ object PlaybackComponents {
     var favoritesFactory: (Context) -> FavoritesWriter = { notInstalled("favoritesFactory") }
 
     @Volatile
+    var historyFactory: (Context) -> PlaybackHistory = { notInstalled("historyFactory") }
+
+    @Volatile
     var settingsFactory: (Context) -> PlaybackSettings = { notInstalled("settingsFactory") }
 
     private fun notInstalled(name: String): Nothing = error(
@@ -121,12 +124,37 @@ interface FavoritesWriter {
     fun setLiked(mediaId: String, liked: Boolean)
 }
 
+/**
+ * Play-history sink (§6.6).
+ *
+ * :core:playback cannot depend on :core:data (that would invert the module graph), so
+ * the service talks to this interface and `:app` installs the Room-backed logger.
+ */
+interface PlaybackHistory {
+    fun start(trackId: String, rendition: String?, isPrivate: Boolean): String
+    fun progress(eventId: String, playedMs: Int)
+    fun end(eventId: String, reason: String, playedMs: Int)
+}
+
+/** Immutable settings snapshot applied by the playback service. */
+data class PlaybackSettingsSnapshot(
+    override val crossfadeMs: Long = 0L,
+    override val normalizationTargetLufs: Float? = null,
+    override val pureMode: Boolean = false,
+    override val outputVolume: Float = 1f,
+    override val privateHistory: Boolean = false,
+) : PlaybackSettings
+
 /** Snapshot of playback-relevant settings, read once when the service starts. */
 interface PlaybackSettings {
     val crossfadeMs: Long
     val normalizationTargetLufs: Float?
     val pureMode: Boolean
     val outputVolume: Float
+    val privateHistory: Boolean get() = false
+
+    /** Emits whenever the user changes a playback setting. Null = not observable. */
+    val changes: kotlinx.coroutines.flow.Flow<PlaybackSettings>? get() = null
 }
 
 /**

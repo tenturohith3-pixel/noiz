@@ -40,7 +40,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
-import androidx.work.workDataOf
 
 /**
  * Catalog read/write model (§8.4, §12.3).
@@ -108,7 +107,9 @@ class CatalogRepository @Inject constructor(
             ),
             op = outboxOp(
                 type = if (liked) "favorite.add" else "favorite.remove",
-                payload = """{"track_id":"$trackId"}""",
+                // The server reads camelCase payload keys (§10); the snake_case form
+                // made every favorite op come back "invalid" and be dropped.
+                payload = """{"trackId":"$trackId"}""",
             ),
         )
         scheduleFlush()
@@ -229,7 +230,7 @@ class CatalogRepository @Inject constructor(
             entry = entry,
             op = outboxOp(
                 type = "playlist.add",
-                payload = outboxJson("playlist_id" to playlistId, "track_id" to trackId, "position_key" to entry.positionKey),
+                payload = outboxJson("playlistId" to playlistId, "trackId" to trackId, "positionKey" to entry.positionKey),
             ),
         )
         scheduleFlush()
@@ -238,7 +239,7 @@ class CatalogRepository @Inject constructor(
     private fun tailKeyAfter(lastKey: String?): String =
         if (lastKey == null) LexoRank.first() else LexoRank.between(lastKey, null)
 
-    suspend fun removeFromPlaylist(playlistId: String, entryId: String) {
+    suspend fun removeFromPlaylist(playlistId: String, entryId: String, trackId: String) {
         // Tombstone + outbox op must land in ONE transaction: a crash between them would
         // either lose the removal or enqueue an edit the local DB never applied (§8.4).
         db.mutationDao().removeEntryWithOutbox(
@@ -246,13 +247,18 @@ class CatalogRepository @Inject constructor(
             entryId = entryId,
             op = outboxOp(
                 type = "playlist.remove",
-                payload = outboxJson("playlist_id" to playlistId, "entry_id" to entryId),
+                payload = outboxJson("playlistId" to playlistId, "trackId" to trackId),
             ),
         )
         scheduleFlush()
     }
 
-    suspend fun moveInPlaylist(playlistId: String, entryId: String, positionKey: String) {
+    suspend fun moveInPlaylist(
+        playlistId: String,
+        entryId: String,
+        trackId: String,
+        positionKey: String,
+    ) {
         db.mutationDao().moveEntryWithOutbox(
             playlistId = playlistId,
             entryId = entryId,
@@ -260,9 +266,9 @@ class CatalogRepository @Inject constructor(
             op = outboxOp(
                 type = "playlist.move",
                 payload = outboxJson(
-                    "playlist_id" to playlistId,
-                    "entry_id" to entryId,
-                    "position_key" to positionKey,
+                    "playlistId" to playlistId,
+                    "trackId" to trackId,
+                    "positionKey" to positionKey,
                 ),
             ),
         )
@@ -293,17 +299,92 @@ class CatalogRepository @Inject constructor(
     // --------------------------------------------------------------- sync --
 
     /**
-     * Pulls one page of catalog changes into Room. Cursor-agnostic by design: the
-     * worker keeps the cursor in `DataStore` so a killed process resumes rather than
+     * Pulls one page of catalog changes into Room. Cursor-agnostic by design: [syncAll]
+     * keeps the cursor in SharedPreferences so a killed process resumes rather than
      * re-downloading from zero (§10.1 `/catalog/sync`).
      */
-    suspend fun pullPage(cursor: String?): SyncPage = withContext(Dispatchers.IO) {        val page = api.catalogSync(cursor)
+    suspend fun pullPage(cursor: String?): SyncPage = withContext(Dispatchers.IO) {
+        val page = api.catalogSync(cursor)
 
         db.trackDao().upsertAll(page.tracks.map { it.toEntity() })
         db.albumDao().upsertAll(page.albums.map { it.toEntity() })
         db.artistDao().upsertAll(page.artists.map { it.toEntity() })
         db.playlistDao().upsert(page.playlists.map { it.toEntity() })
-        db.renditionDao().upsertAll(page.tracks.map { track ->
+        upsertRenditions(page.tracks)
+
+        SyncPage(nextCursor = page.nextCursor, hasMore = page.nextCursor != null)
+    }
+
+    /**
+     * Drains `/catalog/sync` until the server says there is no next page.
+     *
+     * The cursor survives process death and WorkManager retries, so a library larger
+     * than one page (or one worker run) eventually converges instead of starting over.
+     * A 404 means the server predates `/catalog/sync`; the older flat
+     * `/catalog/tracks` endpoint is still enough to populate Room for playback.
+     *
+     * @return true when the replica is fully synced, false when the page budget ran out.
+     */
+    suspend fun syncAll(): Boolean = withContext(Dispatchers.IO) {
+        var cursor = syncPrefs().getString(KEY_SYNC_CURSOR, null)
+        var pages = 0
+
+        while (pages < MAX_SYNC_PAGES) {
+            val page = try {
+                pullPage(cursor)
+            } catch (missing: retrofit2.HttpException) {
+                if (missing.code() == 404) {
+                    // Forget a cursor minted by a different/newer server before falling
+                    // back, otherwise every future run starts from a page it cannot use.
+                    syncPrefs().edit().remove(KEY_SYNC_CURSOR).apply()
+                    return@withContext pullLegacyCatalog()
+                }
+                throw missing
+            }
+
+            pages++
+            cursor = page.nextCursor
+            syncPrefs().edit().apply {
+                if (cursor == null) remove(KEY_SYNC_CURSOR) else putString(KEY_SYNC_CURSOR, cursor)
+            }.apply()
+
+            if (!page.hasMore) {
+                // The FTS index is only populated here, so offline search stayed empty
+                // until a sync happened to run (§6.3).
+                rebuildSearchIndex()
+                return@withContext true
+            }
+        }
+
+        // Ran out of budget with pages still pending — the next sync resumes from the
+        // stored cursor rather than silently leaving the replica half-populated.
+        rebuildSearchIndex()
+        false
+    }
+
+    /** Compatibility path for servers without `/catalog/sync`; tracks-only by design. */
+    private suspend fun pullLegacyCatalog(): Boolean {
+        var offset = 0
+        repeat(MAX_SYNC_PAGES) {
+            val page = api.catalogTracks(limit = LEGACY_PAGE_SIZE, offset = offset)
+            if (page.tracks.isEmpty()) {
+                rebuildSearchIndex()
+                return true
+            }
+            db.trackDao().upsertAll(page.tracks.map { it.toEntity() })
+            upsertRenditions(page.tracks)
+            offset += page.tracks.size
+            if (page.tracks.size < LEGACY_PAGE_SIZE || offset >= page.total) {
+                rebuildSearchIndex()
+                return true
+            }
+        }
+        rebuildSearchIndex()
+        return false
+    }
+
+    private suspend fun upsertRenditions(tracks: List<com.noiz.network.TrackDto>) {
+        val renditions = tracks.flatMap { track ->
             track.renditions.map { rendition ->
                 com.noiz.database.RenditionEntity(
                     trackId = track.id,
@@ -316,27 +397,14 @@ class CatalogRepository @Inject constructor(
                     sha256 = rendition.sha256,
                 )
             }
-        }.flatten())
-
-        SyncPage(nextCursor = page.nextCursor, hasMore = page.nextCursor != null)
+        }
+        if (renditions.isNotEmpty()) db.renditionDao().upsertAll(renditions)
     }
 
+    private fun syncPrefs() = appContext.getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+
     suspend fun hydrateRenditions(trackId: String) = withContext(Dispatchers.IO) {
-        runCatching { api.track(trackId) }.onSuccess { dto ->
-            val renditions = dto.renditions.map {
-                com.noiz.database.RenditionEntity(
-                    trackId = trackId,
-                    id = it.id,
-                    codec = it.codec,
-                    bitrateKbps = it.bitrateKbps,
-                    sampleRate = it.sampleRate,
-                    bitDepth = it.bitDepth,
-                    sizeBytes = it.sizeBytes,
-                    sha256 = it.sha256,
-                )
-            }
-            db.renditionDao().upsertAll(renditions)
-        }
+        runCatching { api.track(trackId) }.onSuccess { dto -> upsertRenditions(listOf(dto)) }
     }
 
     /** Builds an outbox op stamped with the current HLC so ordering survives restarts. */
@@ -378,6 +446,11 @@ class CatalogRepository @Inject constructor(
     companion object {
         const val SYNC_WORK = "noiz-catalog-sync"
 
+        private const val SYNC_PREFS = "noiz_catalog_sync"
+        private const val KEY_SYNC_CURSOR = "cursor"
+        private const val MAX_SYNC_PAGES = 50
+        private const val LEGACY_PAGE_SIZE = 200
+
         fun enqueueSync(context: Context) {
             val request = OneTimeWorkRequestBuilder<CatalogSyncWorker>()
                 .setConstraints(
@@ -406,27 +479,10 @@ class CatalogSyncWorker @AssistedInject constructor(
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result = try {
-        // Resume from the persisted cursor instead of page 0: without this every run
-        // re-downloads the whole catalog and any catalog larger than MAX_PAGES pages
-        // can never converge (§10.1, §12.7).
-        var cursor = inputData.getString(KEY_CURSOR)
-        repeat(MAX_PAGES) {
-            val page = repository.pullPage(cursor)
-            cursor = page.nextCursor
-            if (page.nextCursor != null) {
-                setProgress(workDataOf(KEY_CURSOR to page.nextCursor))
-            }
-            if (!page.hasMore) {
-                // The FTS index is only populated here, so offline search stayed empty
-                // until a sync happened to run (§6.3).
-                repository.rebuildSearchIndex()
-                return Result.success()
-            }
-        }
-        // Ran out of budget with pages still pending — retry so the next run resumes
-        // from the cursor rather than silently leaving the replica half-populated.
-        repository.rebuildSearchIndex()
-        Result.retry()
+        // The repository owns the persisted cursor; the worker only decides whether a
+        // partial sync should be retried. `syncAll` also rebuilds the FTS index and
+        // falls back to `/catalog/tracks` on servers without `/catalog/sync`.
+        if (repository.syncAll()) Result.success() else Result.retry()
     } catch (io: java.io.IOException) {
         Result.retry()
     } catch (auth: retrofit2.HttpException) {
@@ -434,10 +490,5 @@ class CatalogSyncWorker @AssistedInject constructor(
     } catch (t: Throwable) {
         // A malformed payload must not crash the worker; retry with backoff.
         Result.retry()
-    }
-
-    private companion object {
-        const val MAX_PAGES = 20
-        const val KEY_CURSOR = "noiz.sync.cursor"
     }
 }

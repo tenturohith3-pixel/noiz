@@ -474,7 +474,13 @@ private fun BoxScope.NowPlayingHost(
                     nowPlaying = nowPlaying,
                     onPlayPause = onPlayPause,
                     onNext = onNext,
-                    onExpand = onToggleMiniPlayer,
+                    // The host owns the sheet, so it can expand itself. Relying on a
+                    // caller-supplied callback left the default (empty) in place and the
+                    // mini-player could never open the full Now Playing surface.
+                    onExpand = {
+                        onToggleMiniPlayer()
+                        scope.launch { sheetState.animateTo(SheetValue.Expanded) }
+                    },
                 )
                 ExpandedNowPlaying(
                     nowPlaying = nowPlaying,

@@ -20,7 +20,8 @@ import kotlinx.serialization.Serializable
  * Rules that keep these honest:
  *  - every field the server may add later is optional or defaulted (`ignoreUnknownKeys`
  *    is on in [NoizJson]), so an older client survives a newer server within v1;
- *  - snake_case on the wire, camelCase in Kotlin, mapped with `@SerialName`;
+ *  - the catalog/auth wire format is camelCase (§10), while streaming/upload
+ *    manifests use snake_case; each field is annotated explicitly where it differs;
  *  - *nothing* here reaches the UI: [mappers] converts to `:core:model` types, which is
  *    the only place the rest of the app reads from.
  */
@@ -87,10 +88,10 @@ data class RenditionDto(
     val id: String,
     val codec: String,
     val container: String? = null,
-    @SerialName("bitrate_kbps") val bitrateKbps: Int? = null,
-    @SerialName("sample_rate") val sampleRate: Int? = null,
-    @SerialName("bit_depth") val bitDepth: Int? = null,
-    @SerialName("size_bytes") val sizeBytes: Long = 0L,
+    val bitrateKbps: Int? = null,
+    val sampleRate: Int? = null,
+    val bitDepth: Int? = null,
+    val sizeBytes: Long = 0L,
     val sha256: String = "",
 ) {
     fun toModel(): Rendition = Rendition(
@@ -117,20 +118,19 @@ data class TrackDto(
     val title: String,
     val album: AlbumSummaryDto? = null,
     val artists: List<ArtistSummaryDto> = emptyList(),
-    @SerialName("disc_number") val discNumber: Int = 1,
-    @SerialName("track_number") val trackNumber: Int = 0,
-    @SerialName("duration_ms") val durationMs: Long = 0L,
+    val discNumber: Int = 1,
+    val trackNumber: Int = 0,
+    val durationMs: Long = 0L,
     val explicit: Boolean = false,
     val isrc: String? = null,
-    @SerialName("loudness_lufs") val loudnessLufs: Float? = null,
-    @SerialName("true_peak_db") val truePeakDb: Float? = null,
-    @SerialName("gapless_next") val gaplessNext: Boolean = false,
-    @SerialName("has_lyrics") val hasLyrics: Boolean = false,
-    @SerialName("has_canvas") val hasCanvas: Boolean = false,
+    val loudness: TrackLoudnessDto = TrackLoudnessDto(),
+    val gaplessNext: Boolean = false,
+    val hasLyrics: Boolean = false,
+    val hasCanvas: Boolean = false,
     val artwork: ArtworkDto? = null,
     val renditions: List<RenditionDto> = emptyList(),
-    @SerialName("added_at") val addedAt: Long = 0L,
-    @SerialName("updated_at") val updatedAt: Long = 0L,
+    val addedAt: Long = 0L,
+    val updatedAt: Long = 0L,
 ) {
     fun toModel(): Track = Track(
         id = id,
@@ -143,8 +143,8 @@ data class TrackDto(
         durationMs = durationMs,
         explicit = explicit,
         isrc = isrc,
-        loudnessLufs = loudnessLufs,
-        truePeakDb = truePeakDb,
+        loudnessLufs = loudness.trackLufs,
+        truePeakDb = loudness.trackPeakDb,
         gaplessNext = gaplessNext,
         hasLyrics = hasLyrics,
         hasCanvas = hasCanvas,
@@ -155,20 +155,29 @@ data class TrackDto(
     )
 }
 
+/** Catalog loudness is camelCase; the stream manifest is snake_case (§10). */
+@Serializable
+data class TrackLoudnessDto(
+    val trackLufs: Float? = null,
+    val trackPeakDb: Float? = null,
+    val albumLufs: Float? = null,
+    val albumPeakDb: Float? = null,
+)
+
 @Serializable
 data class AlbumDto(
     val id: String,
     val title: String,
-    @SerialName("artist_name") val artistName: String = "",
-    @SerialName("album_type") val albumType: String? = null,
-    @SerialName("release_year") val releaseYear: Int? = null,
-    @SerialName("track_count") val trackCount: Int = 0,
+    val artistName: String = "",
+    val albumType: String? = null,
+    val releaseYear: Int? = null,
+    val trackCount: Int = 0,
     val artwork: ArtworkDto? = null,
-    @SerialName("dominant_hex") val dominantHex: String? = null,
-    @SerialName("vibrant_hex") val vibrantHex: String? = null,
-    @SerialName("muted_hex") val mutedHex: String? = null,
+    val dominantHex: String? = null,
+    val vibrantHex: String? = null,
+    val mutedHex: String? = null,
     val tracks: List<TrackDto> = emptyList(),
-    @SerialName("updated_at") val updatedAt: Long = 0L,
+    val updatedAt: Long = 0L,
 ) {
     fun toModel(): Album = Album(
         id = id,
@@ -191,9 +200,9 @@ data class AlbumDto(
 data class ArtistDto(
     val id: String,
     val name: String,
-    @SerialName("sort_name") val sortName: String = "",
-    @SerialName("image_hash") val imageHash: String? = null,
-    @SerialName("updated_at") val updatedAt: Long = 0L,
+    val sortName: String = "",
+    val imageHash: String? = null,
+    val updatedAt: Long = 0L,
 ) {
     fun toModel(): Artist = Artist(
         id = id,
@@ -207,13 +216,13 @@ data class ArtistDto(
 @Serializable
 data class PlaylistDto(
     val id: String,
-    @SerialName("owner_id") val ownerId: String = "",
+    val ownerId: String = "",
     val name: String,
     val description: String? = null,
-    @SerialName("is_collaborative") val isCollaborative: Boolean = false,
+    val isCollaborative: Boolean = false,
     val artwork: ArtworkDto? = null,
-    @SerialName("track_count") val trackCount: Int = 0,
-    @SerialName("updated_at") val updatedAt: Long = 0L,
+    val trackCount: Int = 0,
+    val updatedAt: Long = 0L,
 ) {
     fun toModel(): Playlist = Playlist(
         id = id,
@@ -233,7 +242,7 @@ data class SearchResultDto(
     val id: String,
     val title: String,
     val subtitle: String? = null,
-    @SerialName("artwork_hash") val artworkHash: String? = null,
+    val artworkHash: String? = null,
 ) {
     fun toModel(): SearchResult = SearchResult(
         kind = kind,
@@ -253,7 +262,7 @@ data class CatalogPageDto(
     val albums: List<AlbumDto> = emptyList(),
     val artists: List<ArtistDto> = emptyList(),
     val playlists: List<PlaylistDto> = emptyList(),
-    @SerialName("next_cursor") val nextCursor: String? = null,
+    val nextCursor: String? = null,
 )
 
 // -------------------------------------------------------------------------------
@@ -301,15 +310,20 @@ data class StreamManifestDto(
 
 @Serializable
 data class HistoryEventDto(
-    val id: String,
-    @SerialName("track_id") val trackId: String,
-    @SerialName("started_at") val startedAt: String,
-    @SerialName("played_ms") val playedMs: Int,
-    @SerialName("ended_reason") val endedReason: String,
+    val trackId: String,
+    val startedAt: String,
+    val eventType: String = "play",
+    val playedMs: Int,
+    val positionMs: Int? = null,
+    val endedReason: String,
     val rendition: String? = null,
     val offline: Boolean = false,
     val private: Boolean = false,
+    val idempotencyKey: String? = null,
 )
+
+@Serializable
+data class HistoryEventBatchDto(val events: List<HistoryEventDto> = emptyList())
 
 // -------------------------------------------------------------------------------
 // Lyrics (§6.4)
@@ -324,7 +338,7 @@ data class LyricLineDto(
 
 @Serializable
 data class LyricsDto(
-    @SerialName("track_id") val trackId: String = "",
+    val trackId: String = "",
     val lines: List<LyricLineDto> = emptyList(),
     val synced: Boolean = false,
     val provider: String? = null,

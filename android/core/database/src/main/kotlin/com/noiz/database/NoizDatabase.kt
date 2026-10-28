@@ -72,10 +72,24 @@ abstract class NoizDatabase : RoomDatabase() {
     companion object {
         const val NAME = "noiz.db"
 
+        @Volatile
+        private var instance: NoizDatabase? = null
+
         /**
          * The DB is process-wide singleton by design: playback, sync and the UI all
          * read the same instance so Room's invalidation tracker fans out one change.
+         *
+         * Opening two builders for the same file is legal but means two invalidation
+         * trackers, two connection pools and two WAL writers; the UI could sit on a
+         * stale snapshot while playback wrote through the other instance. Every
+         * production caller goes through this accessor.
          */
+        fun get(context: Context): NoizDatabase =
+            instance ?: synchronized(this) {
+                instance ?: build(context.applicationContext).also { instance = it }
+            }
+
+        /** Creates a new instance. Tests use this; production uses [get]. */
         fun build(context: Context): NoizDatabase =
             Room.databaseBuilder(context, NoizDatabase::class.java, NAME)
                 .addCallback(object : Callback() {

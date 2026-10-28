@@ -269,7 +269,9 @@ class DualPlayerEngine(
     private fun transitionTo(target: Int, userSkip: Boolean) {
         if (target !in queue.indices) return
         cancelCrossfade()
-        val wasPlaying = active.isPlaying || _snapshot.value.isPlaying
+        // At a natural end `isPlaying` is already false while `playWhenReady` is still
+        // true; using only isPlaying stopped dual-mode from starting the next track.
+        val wasPlaying = active.isPlaying || active.playWhenReady || _snapshot.value.isPlaying
 
         if (_snapshot.value.mode == PlaybackMode.Gapless) {
             // Keep the playlist loaded so ExoPlayer can keep honouring encoder
@@ -333,9 +335,24 @@ class DualPlayerEngine(
     }
 
     private fun tickDualMode() {
+        val ended = active.playbackState == Player.STATE_ENDED
+
         // Never start a ramp while paused: `run()` calls `inPlayer.play()`, so a tick
-        // landing after a `pause()` would resume audio with no user intent.
-        if (!active.isPlaying) return
+        // landing after a `pause()` would resume audio with no user intent. A paused
+        // player that has reached its natural end still needs the queue to advance —
+        // the old early return left dual mode stuck on the last track forever.
+        if (!active.isPlaying && !ended) return
+
+        if (ended) {
+            val next = nextIndex(forward = true, userInitiated = false)
+                ?: run {
+                    // REPEAT_ONE returns the same index; restarting it is correct.
+                    if (repeatMode == Player.REPEAT_MODE_ONE) transitionTo(index, userSkip = false)
+                    return
+                }
+            transitionTo(next, userSkip = false)
+            return
+        }
 
         val duration = active.duration
         if (duration == C.TIME_UNSET || duration <= 0L) return

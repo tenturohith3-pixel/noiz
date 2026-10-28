@@ -3,6 +3,8 @@ package com.noiz.app
 import android.app.Application
 import androidx.hilt.work.HiltWorkerFactory
 import androidx.work.Configuration
+import com.noiz.data.CatalogRepository
+import com.noiz.data.PlayHistoryLogger
 import dagger.hilt.android.HiltAndroidApp
 import javax.inject.Inject
 
@@ -22,6 +24,12 @@ class NoizApplication : Application(), Configuration.Provider {
     @Inject
     lateinit var workerFactory: HiltWorkerFactory
 
+    @Inject
+    lateinit var catalog: CatalogRepository
+
+    @Inject
+    lateinit var historyLogger: PlayHistoryLogger
+
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
             .setWorkerFactory(workerFactory)
@@ -30,6 +38,6 @@ class NoizApplication : Application(), Configuration.Provider {
 
     override fun onCreate() {
         super.onCreate()
-        AppGraph.install(this)
+        AppGraph.install(this, catalog, historyLogger)
     }
 }

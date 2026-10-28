@@ -35,7 +35,7 @@ object AppModule {
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): NoizDatabase =
-        NoizDatabase.build(context)
+        NoizDatabase.get(context)
 
     @Provides
     @Singleton
@@ -93,16 +93,25 @@ private class SessionTokenStore(private val context: Context) : TokenStore {
     private var cached: com.noiz.network.TokenSnapshot? = null
 
     override fun snapshot(): com.noiz.network.TokenSnapshot? {
-        cached?.let { return it }
-        return kotlinx.coroutines.runBlocking {
+        cached?.let { snap ->
+            // A cached access token past its expiry must not be reused: the API client
+            // would attach it to every request until the process restarted.
+            if (snap.expiresAtEpochMs <= 0L || snap.expiresAtEpochMs > System.currentTimeMillis()) {
+                return snap
+            }
+        }
+        cached = null
+        val fresh = kotlinx.coroutines.runBlocking {
             SessionStore(context).session.first()?.let {
                 com.noiz.network.TokenSnapshot(
                     accessToken = it.accessToken,
                     refreshToken = it.refreshToken,
                     expiresAtEpochMs = it.expiresAtEpochMs,
-                ).also { snap -> cached = snap }
+                )
             }
         }
+        cached = fresh
+        return fresh
     }
 
     override fun update(access: String, refresh: String, expiresAtEpochMs: Long) {

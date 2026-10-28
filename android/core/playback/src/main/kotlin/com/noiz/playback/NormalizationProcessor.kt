@@ -221,7 +221,7 @@ class NormalizationProcessor(
             // cap would hand back a ~99 dB boost.
             if (trackLufs < MEASURABLE_FLOOR_LUFS) return 0f
 
-            val raw = (targetLufs - trackLufs).coerceIn(MAX_BOOST_DB, MAX_ATTENUATION_DB)
+            val raw = (targetLufs - trackLufs).coerceIn(MAX_ATTENUATION_DB, MAX_BOOST_DB)
 
             val peak = truePeakDb
             if (peak == null || !peak.isFinite() || peak > 0f) {

@@ -123,6 +123,8 @@ data class NoizSettings(
     val normalizationEnabled: Boolean = true,
     /** Loudness target for normalization; ignored when [normalizationEnabled] is false. */
     val targetLufs: Float = -14f,
+    /** Linear output volume applied to the engine, 0..1. */
+    val outputVolume: Float = 1f,
     /** True = leave the source untouched (bit-perfect when the device path allows). */
     val pureMode: Boolean = false,
     val qualityProfile: QualityProfile = QualityProfile.HIGH,
@@ -143,6 +145,7 @@ class SettingsStore(private val context: Context) {
             crossfadeMs = prefs[KEY_CROSSFADE_MS] ?: 0L,
             normalizationEnabled = prefs[KEY_NORMALIZATION] ?: true,
             targetLufs = prefs[KEY_TARGET_LUFS] ?: -14f,
+            outputVolume = prefs[KEY_OUTPUT_VOLUME] ?: 1f,
             pureMode = prefs[KEY_PURE_MODE] ?: false,
             qualityProfile = QualityProfile.fromWire(prefs[KEY_QUALITY]),
             glassTier = prefs[KEY_GLASS_TIER] ?: "auto",
@@ -159,6 +162,8 @@ class SettingsStore(private val context: Context) {
     suspend fun setNormalization(enabled: Boolean) = edit { it[KEY_NORMALIZATION] = enabled }
 
     suspend fun setTargetLufs(value: Float) = edit { it[KEY_TARGET_LUFS] = value.coerceIn(-24f, -6f) }
+
+    suspend fun setOutputVolume(value: Float) = edit { it[KEY_OUTPUT_VOLUME] = value.coerceIn(0f, 1f) }
 
     suspend fun setPureMode(enabled: Boolean) = edit { it[KEY_PURE_MODE] = enabled }
 
@@ -183,6 +188,7 @@ class SettingsStore(private val context: Context) {
         private val KEY_CROSSFADE_MS = longPreferencesKey("crossfade_ms")
         private val KEY_NORMALIZATION = booleanPreferencesKey("normalization_enabled")
         private val KEY_TARGET_LUFS = floatPreferencesKey("target_lufs")
+        private val KEY_OUTPUT_VOLUME = floatPreferencesKey("output_volume")
         private val KEY_PURE_MODE = booleanPreferencesKey("pure_mode")
         private val KEY_QUALITY = stringPreferencesKey("quality_profile")
         private val KEY_GLASS_TIER = stringPreferencesKey("glass_tier")

@@ -117,7 +117,7 @@ interface NoizApi {
     suspend fun favorites(): List<String>
 
     @POST("api/v1/history/events")
-    suspend fun pushHistory(@Body body: List<HistoryEventDto>)
+    suspend fun pushHistory(@Body body: HistoryEventBatchDto)
 
     // --------------------------------------------------------------- playback --
 
@@ -189,9 +189,9 @@ data class HomeCardDto(
     val id: String,
     val title: String,
     val subtitle: String? = null,
-    @SerialName("artwork_hash") val artworkHash: String? = null,
-    @SerialName("target_type") val targetType: String? = null,
-    @SerialName("target_id") val targetId: String? = null,
+    val artworkHash: String? = null,
+    val targetType: String? = null,
+    val targetId: String? = null,
 )
 
 @Serializable

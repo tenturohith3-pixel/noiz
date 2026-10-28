@@ -1,14 +1,21 @@
 package com.noiz.app
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
@@ -30,6 +37,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
@@ -46,6 +54,9 @@ import com.noiz.home.HomeUiState
 import com.noiz.home.NowPlayingUiState
 import com.noiz.model.RepeatMode
 import com.noiz.model.Track
+import com.noiz.playback.PlaybackService
+import com.noiz.playback.PlaybackStateBus
+import com.noiz.playback.PlaybackStatus
 import dev.chrisbanes.haze.HazeState
 import kotlinx.coroutines.flow.first
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -64,9 +75,22 @@ class MainActivity : ComponentActivity() {
 
     private val glassController by lazy { GlassTierController(applicationContext, lifecycleScope) }
 
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* optional */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
+
+        // The media notification is the only way to control playback from outside the
+        // app. On API 33+ it is invisible until this permission is granted, and the
+        // manifest declaration alone does not request it.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
 
         setContent {
             val hazeState = remember { HazeState() }
@@ -94,6 +118,7 @@ class MainActivity : ComponentActivity() {
 private fun NoizApp(hazeState: HazeState) {
     val context = LocalContext.current
     val viewModel: LibraryViewModel = hiltViewModel()
+    val playback by PlaybackStateBus.state.collectAsStateWithLifecycle()
 
     var signedIn by remember { mutableStateOf<Boolean?>(null) }
 
@@ -117,12 +142,17 @@ private fun NoizApp(hazeState: HazeState) {
             val state by viewModel.state.collectAsStateWithLifecycle()
             LibraryScreen(
                 state = state,
+                playback = playback,
                 hazeState = hazeState,
-                viewModel = viewModel,
                 onQueryChange = viewModel::setQuery,
                 onRetry = viewModel::refresh,
                 onPlay = { track -> PlaybackBridge.play(context, track) },
                 onPlayAll = { tracks -> PlaybackBridge.playAll(context, tracks) },
+                onPlayPause = { PlaybackBridge.send(context, PlaybackService.ACTION_TOGGLE_PLAY) },
+                onNext = { PlaybackBridge.send(context, PlaybackService.ACTION_NEXT) },
+                onSeek = { positionMs -> PlaybackBridge.seek(context, positionMs) },
+                onShuffle = { PlaybackBridge.send(context, PlaybackService.ACTION_SHUFFLE) },
+                onRepeat = { PlaybackBridge.send(context, PlaybackService.ACTION_REPEAT) },
             )
         }
     }
@@ -131,25 +161,35 @@ private fun NoizApp(hazeState: HazeState) {
 /**
  * The library surface.
  *
- * Maps [LibraryUiState] onto the existing [HomeScreen] contract so the glass UI, the
- * mini-player and the Now Playing sheet all get real data. Search is a local filter
- * over the loaded catalogue, which is what §7.1 asks for on the Library tab.
+ * Maps [LibraryUiState] and the process-wide [PlaybackStatus] onto the existing
+ * [HomeScreen] contract so the glass UI, the mini-player and the Now Playing sheet all
+ * show and control the same session the notification does.
  */
 @Composable
 private fun LibraryScreen(
     state: LibraryUiState,
+    playback: PlaybackStatus,
     hazeState: HazeState,
-    viewModel: LibraryViewModel,
     onQueryChange: (String) -> Unit,
     onRetry: () -> Unit,
     onPlay: (Track) -> Unit,
     onPlayAll: (List<Track>) -> Unit,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onShuffle: () -> Unit,
+    onRepeat: () -> Unit,
 ) {
     val loadingLabel = stringResource(R.string.connect_loading)
     val emptyLabel = stringResource(R.string.connect_empty)
     val retryLabel = stringResource(R.string.connect_retry)
 
-    val homeState = remember(state.tracks, state.query) {
+    val artworkUrl = remember(state.tracks, playback.trackId) {
+        state.tracks.firstOrNull { it.id == playback.trackId }?.artwork?.url
+    }
+    val positionEpochMs = remember(playback) { SystemClock.elapsedRealtime() }
+
+    val homeState = remember(state.tracks, state.query, playback, artworkUrl) {
         val cards = state.tracks.map { track ->
             HomeCard(
                 id = track.id,
@@ -166,7 +206,26 @@ private fun LibraryScreen(
                     cards = cards,
                 ),
             ),
-            nowPlaying = NowPlayingUiState(canPlay = false),
+            nowPlaying = NowPlayingUiState(
+                title = playback.title,
+                artist = playback.artist,
+                album = playback.album,
+                artworkUrl = artworkUrl,
+                isPlaying = playback.isPlaying,
+                durationMs = playback.durationMs,
+                positionMs = {
+                    if (playback.isPlaying) {
+                        playback.positionMs +
+                            (SystemClock.elapsedRealtime() - positionEpochMs)
+                    } else {
+                        playback.positionMs
+                    }
+                },
+                hasNext = playback.hasNext,
+                canPlay = playback.canPlay,
+                repeatMode = playback.repeatMode.toRepeatMode(),
+                shuffleEnabled = playback.shuffleEnabled,
+            ),
         )
     }
 
@@ -177,7 +236,7 @@ private fun LibraryScreen(
             label = { Text("Search your library") },
             singleLine = true,
             modifier = Modifier
-                .fillMaxSize(0.94f)
+                .fillMaxWidth()
                 .padding(start = 20.dp, end = 20.dp, top = 96.dp)
                 .height(52.dp),
         )
@@ -207,6 +266,11 @@ private fun LibraryScreen(
             else -> HomeScreen(
                 state = homeState,
                 hazeState = hazeState,
+                onPlayPause = onPlayPause,
+                onNext = onNext,
+                onSeek = onSeek,
+                onShuffle = onShuffle,
+                onRepeat = onRepeat,
                 onCardClick = { card ->
                     state.tracks.firstOrNull { it.id == card.id }?.let(onPlay)
                 },
@@ -215,12 +279,18 @@ private fun LibraryScreen(
     }
 }
 
+private fun Int.toRepeatMode(): RepeatMode = when (this) {
+    androidx.media3.common.Player.REPEAT_MODE_ONE -> RepeatMode.ONE
+    androidx.media3.common.Player.REPEAT_MODE_ALL -> RepeatMode.ALL
+    else -> RepeatMode.OFF
+}
+
 /**
  * Hands a queue to the playback session.
  *
- * Starts [com.noiz.playback.PlaybackService] and lets the session's browse tree resolve
- * the media ids, so playback goes through the same engine the notification and Android
- * Auto use (§8.3).
+ * Starts [PlaybackService] and lets the session's browse tree resolve the media ids,
+ * so playback goes through the same engine the notification and Android Auto use
+ * (§8.3).
  */
 private object PlaybackBridge {
 
@@ -229,19 +299,26 @@ private object PlaybackBridge {
     fun playAll(context: android.content.Context, tracks: List<Track>) {
         val ids = tracks.map { it.id }
         context.startService(
-            android.content.Intent(
-                context,
-                com.noiz.playback.PlaybackService::class.java,
-            ).apply {
-                action = com.noiz.playback.PlaybackService.ACTION_PLAY
+            Intent(context, PlaybackService::class.java).apply {
+                action = PlaybackService.ACTION_PLAY
                 putStringArrayListExtra(
-                    com.noiz.playback.PlaybackService.EXTRA_TRACK_IDS,
+                    PlaybackService.EXTRA_TRACK_IDS,
                     ArrayList(ids),
                 )
-                putExtra(
-                    com.noiz.playback.PlaybackService.EXTRA_START_INDEX,
-                    0,
-                )
+                putExtra(PlaybackService.EXTRA_START_INDEX, 0)
+            },
+        )
+    }
+
+    fun send(context: android.content.Context, action: String) {
+        context.startService(Intent(context, PlaybackService::class.java).setAction(action))
+    }
+
+    fun seek(context: android.content.Context, positionMs: Long) {
+        context.startService(
+            Intent(context, PlaybackService::class.java).apply {
+                action = PlaybackService.ACTION_SEEK
+                putExtra(PlaybackService.EXTRA_POSITION_MS, positionMs.coerceAtLeast(0L))
             },
         )
     }

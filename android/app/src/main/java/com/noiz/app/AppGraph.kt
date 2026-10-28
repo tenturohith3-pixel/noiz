@@ -10,6 +10,14 @@ import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.NoOpCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
+import coil3.ImageLoader
+import coil3.SingletonImageLoader
+// The Kotlin API is the top-level function `OkHttpNetworkFetcherFactory`; the class
+// `coil3.network.okhttp.OkHttpNetworkFetcher` only exists as a JVM file facade
+// (`@file:JvmName`), so importing it fails to resolve in Kotlin.
+import coil3.network.okhttp.OkHttpNetworkFetcherFactory
+import com.noiz.data.CatalogRepository
+import com.noiz.data.PlayHistoryLogger
 import com.noiz.database.FavoriteEntity
 import com.noiz.database.NoizDatabase
 import com.noiz.database.PlaybackStateDao
@@ -29,8 +37,11 @@ import com.noiz.playback.DualPlayerEngine
 import com.noiz.playback.ExoPlayerAssembler
 import com.noiz.playback.FavoritesWriter
 import com.noiz.playback.NoizLoadErrorHandlingPolicy
+import com.noiz.playback.NoizMediaExtras
 import com.noiz.playback.PlaybackComponents
+import com.noiz.playback.PlaybackHistory
 import com.noiz.playback.PlaybackSettings
+import com.noiz.playback.PlaybackSettingsSnapshot
 import com.noiz.playback.QueueRestoreStore
 import com.noiz.playback.RestoredQueue
 import com.noiz.playback.SignedStreamUrl
@@ -42,6 +53,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
@@ -70,8 +82,12 @@ object AppGraph {
     @Serializable
     private data class StoredQueue(val mediaIds: List<String>, val renditionIds: List<String>)
 
-    fun install(app: Application) {
-        val db = NoizDatabase.build(app)
+    fun install(
+        app: Application,
+        catalog: CatalogRepository,
+        historyLogger: PlayHistoryLogger,
+    ) {
+        val db = NoizDatabase.get(app)
         val sessionStore = SessionStore(app)
         val settingsStore = SettingsStore(app)
 
@@ -82,6 +98,21 @@ object AppGraph {
         val tokenStore = DatastoreTokenStore(sessionStore)
         val clientFactory = NoizClientFactory(tokenStore, serverUrl)
         val manifestSource: StreamManifestSource = clientFactory.streamManifests
+
+        // Album art lives behind the same bearer auth as the API. Coil's default
+        // loader has its own OkHttp client with no interceptor, so every artwork
+        // request was a 401 and every cover fell back to a placeholder.
+        SingletonImageLoader.setSafe { context ->
+            ImageLoader.Builder(context)
+                .components {
+                    add(
+                        // Lambda form: `() -> Call.Factory`, re-read per request so a
+                        // token rotation inside apiClient is picked up immediately.
+                        OkHttpNetworkFetcherFactory(callFactory = { clientFactory.apiClient }),
+                    )
+                }
+                .build()
+        }
 
         // Streaming cache: LRU-bounded, safe to evict at any time (§11 row 11).
         val streamCache = SimpleCache(
@@ -102,6 +133,7 @@ object AppGraph {
         )
 
         val streamTokens = InMemoryTokenStore()
+
         val resolver = SignedUrlResolver(
             streamTokens,
             object : StreamManifestClient {
@@ -134,7 +166,11 @@ object AppGraph {
 
         PlaybackComponents.browseTreeFactory = { RoomBrowseTreeProvider(db) }
 
-        PlaybackComponents.favoritesFactory = { RoomFavoritesWriter(db, ioScope) }
+        PlaybackComponents.favoritesFactory = {
+            RoomFavoritesWriter(db, ioScope, sessionStore, catalog)
+        }
+
+        PlaybackComponents.historyFactory = { RoomPlaybackHistory(historyLogger) }
 
         PlaybackComponents.settingsFactory = { DatastorePlaybackSettings(settingsStore) }
 
@@ -191,16 +227,55 @@ object AppGraph {
         override fun invalidate(trackId: String, rendition: String) {
             cache.remove("$trackId/$rendition")
         }
+
+        override fun invalidateAll() {
+            cache.clear()
+        }
     }
 
     private class DatastorePlaybackSettings(private val store: SettingsStore) : PlaybackSettings {
-        private val current by lazy { runBlocking { store.current() } }
+        private val initial by lazy { runBlocking { store.current() } }
 
-        override val crossfadeMs: Long get() = current.crossfadeMs
+        override val crossfadeMs: Long get() = initial.crossfadeMs
         override val normalizationTargetLufs: Float?
-            get() = if (current.pureMode || !current.normalizationEnabled) null else current.targetLufs
-        override val pureMode: Boolean get() = current.pureMode
-        override val outputVolume: Float get() = 1f
+            get() = if (initial.pureMode || !initial.normalizationEnabled) null else initial.targetLufs
+        override val pureMode: Boolean get() = initial.pureMode
+        override val outputVolume: Float get() = initial.outputVolume
+        override val privateHistory: Boolean get() = initial.privateHistory
+
+        override val changes: kotlinx.coroutines.flow.Flow<PlaybackSettings> =
+            store.settings.map { settings ->
+                PlaybackSettingsSnapshot(
+                    crossfadeMs = settings.crossfadeMs,
+                    normalizationTargetLufs = if (settings.pureMode || !settings.normalizationEnabled) {
+                        null
+                    } else {
+                        settings.targetLufs
+                    },
+                    pureMode = settings.pureMode,
+                    outputVolume = settings.outputVolume,
+                    privateHistory = settings.privateHistory,
+                )
+            }
+    }
+
+    private class RoomPlaybackHistory(
+        private val logger: PlayHistoryLogger,
+    ) : PlaybackHistory {
+
+        override fun start(trackId: String, rendition: String?, isPrivate: Boolean): String =
+            logger.recordStart(
+                trackId = trackId,
+                rendition = rendition,
+                offline = false,
+                isPrivate = isPrivate,
+            )
+
+        override fun progress(eventId: String, playedMs: Int) =
+            logger.recordProgress(eventId, playedMs)
+
+        override fun end(eventId: String, reason: String, playedMs: Int) =
+            logger.recordEnd(eventId, reason, playedMs)
     }
 
     /** Persists the canonical queue into Room's `playback_state` slot 0. */
@@ -279,7 +354,14 @@ object AppGraph {
         }
 
         override fun resolveBlocking(mediaIds: List<String>): List<MediaItem> =
-            runBlocking { db.trackDao().byIds(mediaIds) }.map { it.toPlayableMediaItem() }
+            if (mediaIds.isEmpty()) {
+                emptyList()
+            } else {
+                // SQL `IN` has no defined order; re-map through the caller's list so an
+                // album queue does not come back shuffled.
+                val byId = runBlocking { db.trackDao().byIds(mediaIds) }.associateBy { it.id }
+                mediaIds.mapNotNull { byId[it] }.map { it.toPlayableMediaItem() }
+            }
     }
 
     private fun TrackEntity.toPlayableMediaItem(): MediaItem = MediaItem.Builder()
@@ -303,8 +385,11 @@ object AppGraph {
             MediaItem.RequestMetadata.Builder()
                 .setExtras(
                     android.os.Bundle().apply {
-                        putLong("noiz.durationMs", durationMs)
-                        putString("noiz.rendition", "orig")
+                        putLong(NoizMediaExtras.DURATION_MS, durationMs)
+                        putString(NoizMediaExtras.RENDITION, "orig")
+                        loudnessLufs?.let { putFloat(NoizMediaExtras.LOUDNESS_LUFS, it) }
+                        truePeakDb?.let { putFloat(NoizMediaExtras.TRUE_PEAK_DB, it) }
+                        if (gaplessNext) putBoolean(NoizMediaExtras.GAPLESS_NEXT, true)
                     },
                 )
                 .build(),
@@ -314,18 +399,15 @@ object AppGraph {
     private class RoomFavoritesWriter(
         private val db: NoizDatabase,
         private val ioScope: CoroutineScope,
+        private val sessionStore: SessionStore,
+        private val catalog: CatalogRepository,
     ) : FavoritesWriter {
         override fun setLiked(mediaId: String, liked: Boolean) {
             ioScope.launch {
-                db.favoriteDao().upsert(
-                    FavoriteEntity(
-                        userId = LOCAL_USER,
-                        kind = KIND_TRACK,
-                        targetId = mediaId,
-                        createdAt = System.currentTimeMillis(),
-                        deleted = !liked,
-                    ),
-                )
+                // The repository writes the Room row and its outbox op together, so a
+                // like from the notification/Android Auto actually reaches the server.
+                val userId = sessionStore.session.first()?.user?.id ?: LOCAL_USER
+                runCatching { catalog.setFavorite(userId, mediaId, liked) }
             }
         }
     }

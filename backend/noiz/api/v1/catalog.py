@@ -10,6 +10,7 @@ constraint, and each write uses ON CONFLICT DO NOTHING.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Final
 from uuid import UUID
@@ -27,6 +28,86 @@ LOSSLESS_CODECS: Final = frozenset({"flac", "alac", "wav", "aiff", "pcm", "dsd"}
 
 def _lossless(codec: str | None) -> bool:
     return (codec or "").lower() in LOSSLESS_CODECS
+
+
+def _epoch_ms(value: Any) -> int:
+    """Serialize a timestamptz as epoch milliseconds.
+
+    The Android models use `Long` timestamps; sending ISO-8601 strings made every
+    `addedAt`/`updatedAt` default to zero.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, datetime):
+        return int(value.timestamp() * 1000)
+    return int(value)
+
+
+def _artwork(hash_value: str | None) -> dict[str, str] | None:
+    if not hash_value:
+        return None
+    return {"hash": hash_value, "url": f"/artwork/{hash_value}"}
+
+
+def _metadata_flag(metadata: Any, key: str) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    value = metadata.get(key)
+    return bool(value) if value is not None else False
+
+
+def _track_json(row: Any, *, renditions: list[Any] | None = None) -> dict[str, Any]:
+    metadata = row.get("metadata") or {}
+    artist_id = row.get("artist_id")
+    album_id = row.get("album_id")
+    return {
+        "id": str(row["id"]),
+        "title": row["title"],
+        "durationMs": int(row["duration_ms"] or 0),
+        "discNumber": int(row["disc_number"] or 1),
+        "trackNumber": int(row["track_number"] or 0),
+        "explicit": _metadata_flag(metadata, "explicit"),
+        "isrc": metadata.get("isrc") if isinstance(metadata, dict) else None,
+        "gaplessNext": bool(row["gapless_next"]),
+        "hasLyrics": _metadata_flag(metadata, "lyrics"),
+        "hasCanvas": _metadata_flag(metadata, "canvas"),
+        "loudness": {
+            "trackLufs": row["loudness_lufs"],
+            "trackPeakDb": row["true_peak_db"],
+            "albumLufs": row["album_loudness_lufs"],
+            "albumPeakDb": row["album_peak_db"],
+        },
+        "artists": (
+            [{"id": str(artist_id), "name": row["artist_name"]}]
+            if artist_id is not None
+            else []
+        ),
+        "album": (
+            {"id": str(album_id), "title": row["album_title"]}
+            if album_id is not None
+            else None
+        ),
+        "artwork": _artwork(row.get("artwork_hash")),
+        "addedAt": _epoch_ms(row.get("created_at")),
+        "updatedAt": _epoch_ms(row.get("updated_at")),
+        "renditions": [
+            {
+                "id": rendition["id"],
+                "codec": rendition["codec"],
+                "container": rendition.get("container"),
+                "bitrateKbps": rendition.get("bitrate_kbps"),
+                "sampleRate": rendition.get("sample_rate"),
+                "bitDepth": rendition.get("bit_depth"),
+                "sizeBytes": int(rendition.get("size_bytes") or 0),
+                "sha256": (
+                    rendition["sha256"].hex()
+                    if isinstance(rendition.get("sha256"), (bytes, bytearray))
+                    else (rendition.get("sha256") or "")
+                ),
+            }
+            for rendition in (renditions or [])
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +200,12 @@ async def list_tracks(
 ) -> dict[str, Any]:
     rows = await conn.fetch(
         """
-        SELECT t.id, t.title, t.duration_ms, t.created_at,
-               ar.name AS artist_name,
-               al.title AS album_title,
-               al.artwork_hash,
-               (t.metadata ? 'lyrics') AS has_lyrics
+        SELECT t.id, t.title, t.duration_ms, t.disc_number, t.track_number,
+               t.gapless_next, t.loudness_lufs, t.true_peak_db,
+               t.album_loudness_lufs, t.album_peak_db, t.metadata,
+               t.created_at, t.updated_at,
+               t.artist_id, ar.name AS artist_name,
+               t.album_id, al.title AS album_title, al.artwork_hash
         FROM tracks t
         LEFT JOIN artists ar ON ar.id = t.artist_id
         LEFT JOIN albums al ON al.id = t.album_id
@@ -138,19 +220,7 @@ async def list_tracks(
         "SELECT count(*) FROM tracks WHERE deleted_at IS NULL",
     )
     return {
-        "tracks": [
-            {
-                "id": str(row["id"]),
-                "title": row["title"],
-                "durationMs": row["duration_ms"],
-                "artistName": row["artist_name"],
-                "albumTitle": row["album_title"],
-                "artworkHash": row["artwork_hash"],
-                "hasLyrics": bool(row["has_lyrics"]),
-                "addedAt": row["created_at"],
-            }
-            for row in rows
-        ],
+        "tracks": [_track_json(row) for row in rows],
         "total": int(total or 0),
     }
 
@@ -159,7 +229,7 @@ async def list_tracks(
 async def list_albums(conn: DbConn, principal: PrincipalDep) -> dict[str, Any]:
     rows = await conn.fetch(
         """
-        SELECT al.id, al.title, al.year, al.artwork_hash,
+        SELECT al.id, al.title, al.year, al.artwork_hash, al.updated_at,
                ar.name AS artist_name,
                count(t.id) AS track_count
         FROM albums al
@@ -174,10 +244,16 @@ async def list_albums(conn: DbConn, principal: PrincipalDep) -> dict[str, Any]:
             {
                 "id": str(row["id"]),
                 "title": row["title"],
-                "artistName": row["artist_name"],
-                "year": row["year"],
-                "artworkHash": row["artwork_hash"],
+                "artistName": row["artist_name"] or "",
+                "albumType": None,
+                "releaseYear": row["year"],
                 "trackCount": int(row["track_count"]),
+                "artwork": _artwork(row["artwork_hash"]),
+                "dominantHex": None,
+                "vibrantHex": None,
+                "mutedHex": None,
+                "tracks": [],
+                "updatedAt": _epoch_ms(row["updated_at"]),
             }
             for row in rows
         ]
@@ -188,7 +264,8 @@ async def list_albums(conn: DbConn, principal: PrincipalDep) -> dict[str, Any]:
 async def list_artists(conn: DbConn, principal: PrincipalDep) -> dict[str, Any]:
     rows = await conn.fetch(
         """
-        SELECT ar.id, ar.name, count(DISTINCT al.id) AS album_count
+        SELECT ar.id, ar.name, ar.sort_name, ar.updated_at,
+               count(DISTINCT al.id) AS album_count
         FROM artists ar
         LEFT JOIN albums al ON al.artist_id = ar.id
         GROUP BY ar.id, ar.name
@@ -200,7 +277,10 @@ async def list_artists(conn: DbConn, principal: PrincipalDep) -> dict[str, Any]:
             {
                 "id": str(row["id"]),
                 "name": row["name"],
+                "sortName": row["sort_name"] or row["name"],
+                "imageHash": None,
                 "albumCount": int(row["album_count"]),
+                "updatedAt": _epoch_ms(row["updated_at"]),
             }
             for row in rows
         ]
@@ -225,13 +305,297 @@ async def list_playlists(conn: DbConn, principal: PrincipalDep) -> dict[str, Any
         "playlists": [
             {
                 "id": str(row["id"]),
+                "ownerId": str(principal.user_id),
                 "name": row["name"],
                 "description": row["description"],
+                "isCollaborative": False,
+                "artwork": None,
                 "trackCount": int(row["track_count"]),
-                "updatedAt": row["updated_at"],
+                "updatedAt": _epoch_ms(row["updated_at"]),
             }
             for row in rows
         ]
+    }
+
+
+@router.get("/albums/{album_id}")
+async def get_album(conn: DbConn, principal: PrincipalDep, album_id: UUID) -> dict[str, Any]:
+    album = await conn.fetchrow(
+        """
+        SELECT al.id, al.title, al.year, al.artwork_hash, al.updated_at,
+               ar.name AS artist_name
+        FROM albums al
+        LEFT JOIN artists ar ON ar.id = al.artist_id
+        WHERE al.id = $1
+        """,
+        album_id,
+    )
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown album")
+
+    tracks = await conn.fetch(
+        """
+        SELECT t.id, t.title, t.duration_ms, t.disc_number, t.track_number,
+               t.gapless_next, t.loudness_lufs, t.true_peak_db,
+               t.album_loudness_lufs, t.album_peak_db, t.metadata,
+               t.created_at, t.updated_at,
+               t.artist_id, ar.name AS artist_name,
+               t.album_id, al.title AS album_title, al.artwork_hash
+        FROM tracks t
+        LEFT JOIN artists ar ON ar.id = t.artist_id
+        LEFT JOIN albums al ON al.id = t.album_id
+        WHERE t.album_id = $1 AND t.deleted_at IS NULL
+        ORDER BY t.disc_number ASC, t.track_number ASC NULLS LAST, t.title ASC
+        """,
+        album_id,
+    )
+    return {
+        "id": str(album["id"]),
+        "title": album["title"],
+        "artistName": album["artist_name"] or "",
+        "albumType": None,
+        "releaseYear": album["year"],
+        "trackCount": len(tracks),
+        "artwork": _artwork(album["artwork_hash"]),
+        "dominantHex": None,
+        "vibrantHex": None,
+        "mutedHex": None,
+        "tracks": [_track_json(row) for row in tracks],
+        "updatedAt": _epoch_ms(album["updated_at"]),
+    }
+
+
+@router.get("/artists/{artist_id}")
+async def get_artist(conn: DbConn, principal: PrincipalDep, artist_id: UUID) -> dict[str, Any]:
+    artist = await conn.fetchrow(
+        "SELECT id, name, sort_name, updated_at FROM artists WHERE id = $1",
+        artist_id,
+    )
+    if artist is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown artist")
+    return {
+        "id": str(artist["id"]),
+        "name": artist["name"],
+        "sortName": artist["sort_name"] or artist["name"],
+        "imageHash": None,
+        "updatedAt": _epoch_ms(artist["updated_at"]),
+    }
+
+
+@router.get("/artists/{artist_id}/tracks")
+async def get_artist_tracks(
+    conn: DbConn,
+    principal: PrincipalDep,
+    artist_id: UUID,
+) -> list[dict[str, Any]]:
+    rows = await conn.fetch(
+        """
+        SELECT t.id, t.title, t.duration_ms, t.disc_number, t.track_number,
+               t.gapless_next, t.loudness_lufs, t.true_peak_db,
+               t.album_loudness_lufs, t.album_peak_db, t.metadata,
+               t.created_at, t.updated_at,
+               t.artist_id, ar.name AS artist_name,
+               t.album_id, al.title AS album_title, al.artwork_hash
+        FROM tracks t
+        LEFT JOIN artists ar ON ar.id = t.artist_id
+        LEFT JOIN albums al ON al.id = t.album_id
+        WHERE t.artist_id = $1 AND t.deleted_at IS NULL
+        ORDER BY t.created_at DESC, t.title ASC
+        """,
+        artist_id,
+    )
+    return [_track_json(row) for row in rows]
+
+
+@router.get("/favorites")
+async def list_favorites(conn: DbConn, principal: PrincipalDep) -> list[str]:
+    rows = await conn.fetch(
+        "SELECT track_id FROM favorites WHERE user_id = $1 ORDER BY created_at DESC",
+        principal.user_id,
+    )
+    return [str(row["track_id"]) for row in rows]
+
+
+@router.get("/playlists/{playlist_id}")
+async def get_playlist(
+    conn: DbConn,
+    principal: PrincipalDep,
+    playlist_id: UUID,
+) -> dict[str, Any]:
+    row = await conn.fetchrow(
+        """
+        SELECT p.id, p.owner_id, p.name, p.description, p.updated_at,
+               count(pe.id) AS track_count
+        FROM playlists p
+        LEFT JOIN playlist_entries pe ON pe.playlist_id = p.id
+        WHERE p.id = $1 AND p.owner_id = $2
+        GROUP BY p.id
+        """,
+        playlist_id,
+        principal.user_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown playlist")
+    return {
+        "id": str(row["id"]),
+        "ownerId": str(row["owner_id"]),
+        "name": row["name"],
+        "description": row["description"],
+        "isCollaborative": False,
+        "artwork": None,
+        "trackCount": int(row["track_count"]),
+        "updatedAt": _epoch_ms(row["updated_at"]),
+    }
+
+
+@router.get("/playlists/{playlist_id}/tracks")
+async def get_playlist_tracks(
+    conn: DbConn,
+    principal: PrincipalDep,
+    playlist_id: UUID,
+) -> list[dict[str, Any]]:
+    rows = await conn.fetch(
+        """
+        SELECT t.id, t.title, t.duration_ms, t.disc_number, t.track_number,
+               t.gapless_next, t.loudness_lufs, t.true_peak_db,
+               t.album_loudness_lufs, t.album_peak_db, t.metadata,
+               t.created_at, t.updated_at,
+               t.artist_id, ar.name AS artist_name,
+               t.album_id, al.title AS album_title, al.artwork_hash
+        FROM playlist_entries pe
+        JOIN playlists p ON p.id = pe.playlist_id
+        JOIN tracks t ON t.id = pe.track_id
+        LEFT JOIN artists ar ON ar.id = t.artist_id
+        LEFT JOIN albums al ON al.id = t.album_id
+        WHERE pe.playlist_id = $1 AND p.owner_id = $2 AND t.deleted_at IS NULL
+        ORDER BY pe.position_key ASC
+        """,
+        playlist_id,
+        principal.user_id,
+    )
+    return [_track_json(row) for row in rows]
+
+
+@router.post("/playlists")
+async def create_playlist(
+    conn: DbConn,
+    principal: PrincipalDep,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="name is required")
+    row = await conn.fetchrow(
+        """
+        INSERT INTO playlists (id, owner_id, name, description)
+        VALUES (gen_random_uuid(), $1, $2, $3)
+        RETURNING id, owner_id, name, description, updated_at
+        """,
+        principal.user_id,
+        name,
+        body.get("description"),
+    )
+    return {
+        "id": str(row["id"]),
+        "ownerId": str(row["owner_id"]),
+        "name": row["name"],
+        "description": row["description"],
+        "isCollaborative": False,
+        "artwork": None,
+        "trackCount": 0,
+        "updatedAt": _epoch_ms(row["updated_at"]),
+    }
+
+
+@router.post("/playlists/{playlist_id}/tracks")
+async def add_playlist_track(
+    conn: DbConn,
+    principal: PrincipalDep,
+    playlist_id: UUID,
+    body: dict[str, Any],
+) -> dict[str, str]:
+    raw_track = body.get("trackId") or body.get("track_id")
+    try:
+        track_id = UUID(str(raw_track))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="trackId is required") from None
+    position_key = body.get("positionKey") or body.get("position_key") or f"{int(datetime.now(timezone.utc).timestamp() * 1000):013d}"
+    owned = await conn.fetchval(
+        "SELECT 1 FROM playlists WHERE id = $1 AND owner_id = $2",
+        playlist_id,
+        principal.user_id,
+    )
+    if owned is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown playlist")
+    await conn.execute(
+        """
+        INSERT INTO playlist_entries (id, playlist_id, position_key, track_id, added_by)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4)
+        """,
+        playlist_id,
+        position_key,
+        track_id,
+        principal.user_id,
+    )
+    return {"status": "ok"}
+
+
+@router.delete("/playlists/{playlist_id}/tracks/{track_id}")
+async def remove_playlist_track(
+    conn: DbConn,
+    principal: PrincipalDep,
+    playlist_id: UUID,
+    track_id: UUID,
+) -> dict[str, str]:
+    owned = await conn.fetchval(
+        "SELECT 1 FROM playlists WHERE id = $1 AND owner_id = $2",
+        playlist_id,
+        principal.user_id,
+    )
+    if owned is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown playlist")
+    await conn.execute(
+        "DELETE FROM playlist_entries WHERE playlist_id = $1 AND track_id = $2",
+        playlist_id,
+        track_id,
+    )
+    return {"status": "ok"}
+
+
+@router.get("/catalog/sync")
+async def catalog_sync(
+    conn: DbConn,
+    principal: PrincipalDep,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> dict[str, Any]:
+    """One page of the catalog for the offline replica.
+
+    The Android client stores the cursor and resumes from it after a process death.
+    `nextCursor` is an opaque string here (an offset) so the transport does not leak
+    the pagination strategy into the client.
+    """
+    try:
+        offset = int(cursor) if cursor else 0
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="cursor must be an integer offset",
+        ) from None
+    if offset < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid cursor")
+
+    tracks = await list_tracks(conn, principal, limit=limit, offset=offset)
+    albums = await list_albums(conn, principal)
+    artists = await list_artists(conn, principal)
+    playlists = await list_playlists(conn, principal)
+    next_cursor = str(offset + limit) if len(tracks["tracks"]) == limit else None
+    return {
+        "tracks": tracks["tracks"],
+        "albums": albums["albums"],
+        "artists": artists["artists"],
+        "playlists": playlists["playlists"],
+        "nextCursor": next_cursor,
     }
 
 
@@ -247,7 +611,8 @@ async def get_track(
                t.codec, t.sample_rate, t.bit_depth, t.channels,
                t.loudness_lufs, t.true_peak_db,
                t.album_loudness_lufs, t.album_peak_db,
-               t.gapless_next, t.availability, t.created_at,
+               t.gapless_next, t.availability, t.metadata,
+               t.created_at, t.updated_at,
                t.album_id, al.title AS album_title,
                t.artist_id, ar.name AS artist_name,
                al.artwork_hash
@@ -263,7 +628,8 @@ async def get_track(
 
     renditions = await conn.fetch(
         """
-        SELECT r.id, r.codec, r.sample_rate, r.bit_depth, r.size_bytes, r.bitrate_kbps
+        SELECT r.id, r.codec, r.container, r.sample_rate, r.bit_depth,
+               r.size_bytes, r.bitrate_kbps, r.sha256
         FROM renditions r
         WHERE r.track_id = $1
         ORDER BY
@@ -279,54 +645,17 @@ async def get_track(
         track_id,
     )
 
-    artists: list[dict[str, str]] = []
-    if track["artist_id"] is not None:
-        artists.append({"id": str(track["artist_id"]), "name": track["artist_name"]})
-
-    artwork_hash = track["artwork_hash"]
-    return {
-        "id": str(track["id"]),
-        "title": track["title"],
-        "durationMs": track["duration_ms"],
-        "discNumber": track["disc_number"],
-        "trackNumber": track["track_number"],
-        "codec": track["codec"],
-        "sampleRate": track["sample_rate"],
-        "bitDepth": track["bit_depth"],
-        "channels": track["channels"],
-        "gaplessNext": track["gapless_next"],
-        "availability": track["availability"],
-        "addedAt": track["created_at"],
-        "artists": artists,
-        "album": (
-            {"id": str(track["album_id"]), "title": track["album_title"]}
-            if track["album_id"] is not None
-            else None
-        ),
-        "artwork": (
-            {"hash": artwork_hash, "url": f"/artwork/{artwork_hash}"}
-            if artwork_hash
-            else None
-        ),
-        "loudness": {
-            "trackLufs": track["loudness_lufs"],
-            "trackPeakDb": track["true_peak_db"],
-            "albumLufs": track["album_loudness_lufs"],
-            "albumPeakDb": track["album_peak_db"],
-        },
-        "renditions": [
-            {
-                "id": row["id"],
-                "codec": row["codec"],
-                "sampleRate": row["sample_rate"],
-                "bitDepth": row["bit_depth"],
-                "sizeBytes": row["size_bytes"],
-                "bitrateKbps": row["bitrate_kbps"],
-                "lossless": _lossless(row["codec"]),
-            }
-            for row in renditions
-        ],
-    }
+    payload = _track_json(track, renditions=list(renditions))
+    payload.update(
+        {
+            "codec": track["codec"],
+            "sampleRate": track["sample_rate"],
+            "bitDepth": track["bit_depth"],
+            "channels": track["channels"],
+            "availability": track["availability"],
+        }
+    )
+    return payload
 
 
 @router.get("/search")
@@ -411,6 +740,214 @@ async def search(
             for r in playlists
         )
     return {"results": results[:limit]}
+
+
+# ---------------------------------------------------------------------------
+# Home + lyrics
+# ---------------------------------------------------------------------------
+
+
+def _home_card(
+    *,
+    card_id: str,
+    title: str,
+    subtitle: str | None,
+    artwork_hash: str | None,
+    target_type: str,
+    target_id: str,
+) -> dict[str, Any]:
+    return {
+        "id": card_id,
+        "title": title,
+        "subtitle": subtitle,
+        "artworkHash": artwork_hash,
+        "targetType": target_type,
+        "targetId": target_id,
+    }
+
+
+@router.get("/recommendations/home")
+async def home_sections(conn: DbConn, principal: PrincipalDep) -> dict[str, Any]:
+    """Shelf layout for the Home tab (§6.2).
+
+    The catalog is small enough today that every shelf is a simple indexed query;
+    nothing here is personalised beyond favourites and play history, which is what
+    the client can actually render. Empty shelves are omitted so the UI never shows
+    a heading with no cards.
+    """
+    shelves: list[dict[str, Any]] = []
+
+    recent = await conn.fetch(
+        """
+        SELECT t.id, t.title, ar.name AS artist_name, al.artwork_hash
+        FROM tracks t
+        LEFT JOIN artists ar ON ar.id = t.artist_id
+        LEFT JOIN albums al ON al.id = t.album_id
+        WHERE t.deleted_at IS NULL
+        ORDER BY t.created_at DESC
+        LIMIT 20
+        """,
+    )
+    if recent:
+        shelves.append(
+            {
+                "id": "recently-added",
+                "title": "Recently added",
+                "reason": None,
+                "cards": [
+                    _home_card(
+                        card_id=str(row["id"]),
+                        title=row["title"],
+                        subtitle=row["artist_name"],
+                        artwork_hash=row["artwork_hash"],
+                        target_type="track",
+                        target_id=str(row["id"]),
+                    )
+                    for row in recent
+                ],
+            },
+        )
+
+    favorites = await conn.fetch(
+        """
+        SELECT t.id, t.title, ar.name AS artist_name, al.artwork_hash
+        FROM favorites f
+        JOIN tracks t ON t.id = f.track_id AND t.deleted_at IS NULL
+        LEFT JOIN artists ar ON ar.id = t.artist_id
+        LEFT JOIN albums al ON al.id = t.album_id
+        WHERE f.user_id = $1
+        ORDER BY f.created_at DESC
+        LIMIT 20
+        """,
+        principal.user_id,
+    )
+    if favorites:
+        shelves.append(
+            {
+                "id": "favorites",
+                "title": "Your favorites",
+                "reason": None,
+                "cards": [
+                    _home_card(
+                        card_id=str(row["id"]),
+                        title=row["title"],
+                        subtitle=row["artist_name"],
+                        artwork_hash=row["artwork_hash"],
+                        target_type="track",
+                        target_id=str(row["id"]),
+                    )
+                    for row in favorites
+                ],
+            },
+        )
+
+    playlists = await conn.fetch(
+        """
+        SELECT p.id, p.name, count(pe.id) AS track_count
+        FROM playlists p
+        LEFT JOIN playlist_entries pe ON pe.playlist_id = p.id
+        WHERE p.owner_id = $1
+        GROUP BY p.id
+        ORDER BY p.updated_at DESC
+        LIMIT 20
+        """,
+        principal.user_id,
+    )
+    if playlists:
+        shelves.append(
+            {
+                "id": "playlists",
+                "title": "Your playlists",
+                "reason": None,
+                "cards": [
+                    _home_card(
+                        card_id=str(row["id"]),
+                        title=row["name"],
+                        subtitle=f"{int(row['track_count'])} tracks",
+                        artwork_hash=None,
+                        target_type="playlist",
+                        target_id=str(row["id"]),
+                    )
+                    for row in playlists
+                ],
+            },
+        )
+
+    return {"shelves": shelves}
+
+
+# Matches LRC timestamps such as `[01:23.45]` or `[01:23]`.
+_LRC_TIMESTAMP: Final = re.compile(r"^\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]\s?")
+
+
+def _lyric_lines(value: Any) -> tuple[list[dict[str, Any]], bool]:
+    """Normalises stored lyrics into the client's line list.
+
+    Accepted shapes: a plain multi-line string (unsynced), an LRC string (synced),
+    or an already-structured list from a future ingest pipeline.
+    """
+    if isinstance(value, list):
+        structured = [
+            item
+            for item in value
+            if isinstance(item, dict) and item.get("text") is not None
+        ]
+        lines = [
+            {
+                "timeMs": int(item["timeMs"]) if item.get("timeMs") is not None else None,
+                "text": str(item["text"]),
+            }
+            for item in structured
+        ]
+        return lines, any(item.get("timeMs") is not None for item in structured)
+
+    if not isinstance(value, str) or not value.strip():
+        return [], False
+
+    lines: list[dict[str, Any]] = []
+    synced = False
+    for raw in value.splitlines():
+        match = _LRC_TIMESTAMP.match(raw)
+        if match:
+            minutes, seconds, fraction = match.groups()
+            millis = int(fraction.ljust(3, "0")) if fraction else 0
+            lines.append(
+                {
+                    "timeMs": (int(minutes) * 60 + int(seconds)) * 1000 + millis,
+                    "text": raw[match.end():],
+                },
+            )
+            synced = True
+        else:
+            lines.append({"timeMs": None, "text": raw})
+    return lines, synced
+
+
+@router.get("/lyrics/{track_id}")
+async def get_lyrics(conn: DbConn, principal: PrincipalDep, track_id: UUID) -> dict[str, Any]:
+    """Lyrics for one track (§6.4).
+
+    Ingest stores sidecar lyrics under `metadata.lyrics`; there is no separate table
+    yet. A track without lyrics is a 200 with an empty line list rather than a 404:
+    the client treats "no lyrics" as a normal state and a 404 would surface as an
+    error banner.
+    """
+    metadata = await conn.fetchval(
+        "SELECT metadata FROM tracks WHERE id = $1 AND deleted_at IS NULL",
+        track_id,
+    )
+    if metadata is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown track")
+
+    stored = metadata.get("lyrics") if isinstance(metadata, dict) else None
+    lines, synced = _lyric_lines(stored)
+    return {
+        "trackId": str(track_id),
+        "lines": lines,
+        "synced": synced,
+        "provider": "embedded" if lines else None,
+        "attribution": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +1138,7 @@ async def sync_outbox(
 
 
 @router.post("/me/events", response_model=AcceptedResponse)
+@router.post("/history/events", response_model=AcceptedResponse)
 async def submit_events(
     body: PlayEventBatch,
     conn: DbConn,

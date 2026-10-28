@@ -64,6 +64,15 @@ interface StreamTokenStore {
     fun signatureFor(trackId: String, rendition: String): SignedStreamUrl?
     fun put(trackId: String, rendition: String, url: SignedStreamUrl)
     fun invalidate(trackId: String, rendition: String)
+
+    /**
+     * Drops every minted URL after an auth failure.
+     *
+     * The error arrives with the *resolved* https URI, so the original
+     * `noiz://track/{id}/{rendition}` is no longer recoverable; clearing the small
+     * in-memory map is cheaper than leaving dead signatures in place.
+     */
+    fun invalidateAll() = Unit
 }
 
 /** Blocking manifest fetch. Implemented in :core:network on top of the sync OkHttp client. */
@@ -108,11 +117,18 @@ class NoizLoadErrorHandlingPolicy(
     }
 
     private fun invalidateSignature(uri: Uri?) {
-        val target = uri ?: return
-        if (target.scheme != SignedUrlResolver.NOIZ_SCHEME) return
-        val id = target.pathSegments.getOrNull(0) ?: return
-        val rendition = target.pathSegments.getOrNull(1) ?: SignedUrlResolver.RENDITION_ORIG
-        tokenStore?.invalidate(id, rendition)
+        // The error carries the resolved https URL, not the noiz:// key the cache is
+        // indexed by. Invalidate the specific entry when it still has the custom
+        // scheme, and clear the map otherwise so the next resolve cannot reuse a dead
+        // signature for twenty retries.
+        val target = uri
+        if (target != null && target.scheme == SignedUrlResolver.NOIZ_SCHEME) {
+            val id = target.pathSegments.getOrNull(0)
+            val rendition = target.pathSegments.getOrNull(1) ?: SignedUrlResolver.RENDITION_ORIG
+            if (id != null) tokenStore?.invalidate(id, rendition)
+        } else {
+            tokenStore?.invalidateAll()
+        }
     }
 
     override fun getMinimumLoadableRetryCount(dataType: Int): Int = MAX_RETRIES
