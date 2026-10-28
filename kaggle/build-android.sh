@@ -23,12 +23,14 @@ run_root() {
 }
 
 echo "== 1/5 Java 17+ =="
-if ! java -version 2>/dev/null | head -1 | grep -qE 'version "(17|18|19|20|21|22|23)'; then
+# java prints its version banner on stderr, so check with 2>&1.
+if ! java -version 2>&1 | head -1 | grep -qE 'version "(17|18|19|20|21|22|23)'; then
     run_root apt-get update -qq && run_root apt-get install -y -qq openjdk-17-jdk-headless
 fi
 java -version 2>&1 | head -1
 
 echo "== 2/5 Android SDK cmdline-tools =="
+command -v unzip >/dev/null 2>&1 || run_root apt-get install -y -qq unzip
 CMD_TOOLS_ZIP="commandlinetools-linux-11076708_latest.zip"
 if [ ! -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
     mkdir -p "$SDK_ROOT/cmdline-tools"
@@ -41,7 +43,9 @@ export ANDROID_SDK_ROOT="$SDK_ROOT"
 export PATH="$SDK_ROOT/cmdline-tools/latest/bin:$SDK_ROOT/platform-tools:$PATH"
 
 echo "== 3/5 Licenses + packages =="
-yes | sdkmanager --licenses >/dev/null
+# 'yes' always exits with SIGPIPE when sdkmanager closes the pipe; with
+# 'set -o pipefail' that would abort the script, so swallow its exit.
+(yes | sdkmanager --licenses >/dev/null) || true
 sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;34.0.0" >/dev/null
 
 echo "== 4/5 Gradle dependencies (warm cache; Gradle 8.11.1 wrapper downloads itself) =="
